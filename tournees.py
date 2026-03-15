@@ -80,7 +80,6 @@ if "df_stops"     not in st.session_state: st.session_state.df_stops     = _init
 if "result"       not in st.session_state: st.session_state.result       = None
 if "tour_date"    not in st.session_state: st.session_state.tour_date    = datetime.date.today()
 if "driver"       not in st.session_state: st.session_state.driver       = ""
-if "heure_depart" not in st.session_state: st.session_state.heure_depart = datetime.time(7, 30)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCODAGE – API Adresse gouv.fr + fallback Nominatim
@@ -132,6 +131,53 @@ def _fmt_min(minutes):
     m = int(minutes) % 60
     return f"{h:02d}:{m:02d}"
 
+
+
+def _compute_optimal_departure(tour, matrix, time_windows):
+    """
+    Calcule l'heure de départ optimale du dépôt.
+
+    Logique :
+    - On calcule pour chaque arrêt le temps cumulé depuis le dépôt
+      (trajet + durées d'intervention des arrêts précédents).
+    - Pour les contraintes "Pas après" (latest) : le départ ne peut pas
+      dépasser latest_i - cumul_i  → on prend le minimum de ces valeurs.
+    - Pour les contraintes "Pas avant" (earliest) : on peut partir plus tôt
+      pour éviter l'attente → on prend le minimum entre le départ calculé
+      depuis "Pas après" et earliest_i - cumul_i.
+    - Si aucune contrainte : retourne None (pas de contrainte de départ).
+    """
+    n = len(tour)
+    # Calcul des temps cumulés (trajet pur + interventions) depuis le dépôt
+    cumul = 0.0
+    cumuls = []          # cumuls[k] = temps cumulé pour atteindre tour[k] (k>=1)
+    for k in range(1, n):
+        prev = tour[k - 1]
+        curr = tour[k]
+        cumul += (matrix[prev][curr] or 0) / 60
+        cumuls.append(cumul)
+        # Ajouter la durée d'intervention de l'arrêt courant (sauf le dernier retour)
+        dur = time_windows[curr].get("duration", 0) or 0
+        cumul += dur
+
+    candidates = []
+    for k, idx in enumerate(tour[1:]):
+        tw = time_windows[idx]
+        cumul_k = cumuls[k]
+        if tw.get("latest") is not None:
+            # Dernier départ pour arriver à temps : latest - cumul
+            candidates.append(tw["latest"] - cumul_k)
+        if tw.get("earliest") is not None:
+            # Départ idéal pour arriver exactement à l'ouverture (sans attente)
+            candidates.append(tw["earliest"] - cumul_k)
+
+    if not candidates:
+        return None  # Aucune contrainte
+
+    # Départ le plus tardif qui respecte toutes les contraintes
+    optimal = min(candidates)
+    # Arrondir à la minute inférieure
+    return max(0, int(optimal))
 
 def _compute_arrivals(tour, matrix, depart_min, time_windows):
     """
@@ -572,12 +618,6 @@ with st.sidebar:
     st.session_state.driver = st.text_input(
         "👤 Chauffeur", value=st.session_state.driver,
         placeholder="ex : Jean Dupont")
-    st.session_state.heure_depart = st.time_input(
-        "🕖 Heure de départ du dépôt",
-        value=st.session_state.heure_depart,
-        step=300,
-        help="Heure à laquelle le chauffeur quitte le dépôt")
-
     st.divider()
     st.subheader("🚛 Véhicule")
     fuel_conso = st.number_input(
@@ -777,7 +817,6 @@ with tab_saisie:
             st.stop()
 
         # Fenêtres temporelles (index 0 = dépôt, pas de contrainte)
-        depart_min  = st.session_state.heure_depart.hour * 60 + st.session_state.heure_depart.minute
         time_windows = [{"earliest": None, "latest": None, "duration": 0}]  # index 0 = dépôt
         for _, row in valid_stops.iterrows():
             if geo.get(row["Adresse"]):
@@ -792,10 +831,40 @@ with tab_saisie:
                 })
 
         with st.spinner("🗺️ Calcul de l'itinéraire optimisé…"):
-            trip = osrm_trip(coords_list, time_windows=time_windows, depart_min=depart_min)
+            # Première passe sans heure de départ (ordre pur)
+            trip = osrm_trip(coords_list, time_windows=time_windows, depart_min=None)
             if not trip:
                 st.stop()
             orig = osrm_route_distance(coords_list)
+
+        # Calcul automatique de l'heure de départ optimale
+        depart_min_opt = _compute_optimal_departure(trip["order"], trip["matrix"], time_windows)
+
+        if depart_min_opt is not None:
+            depart_min = depart_min_opt
+            st.info(
+                f"🕖 **Heure de départ recommandée du dépôt : {_fmt_min(depart_min)}** "
+                f"— calculée automatiquement pour respecter toutes les contraintes "
+                f"avec le minimum d'attente."
+            )
+        else:
+            # Aucune contrainte : on part à 07h30 par défaut
+            depart_min = 7 * 60 + 30
+            st.info(
+                "🕖 **Aucune contrainte horaire renseignée.** "
+                f"Heure de départ par défaut : **{_fmt_min(depart_min)}**"
+            )
+
+        # Seconde passe 2-opt avec l'heure de départ calculée (affine si TW présentes)
+        has_tw = any(
+            tw.get("earliest") is not None or tw.get("latest") is not None
+            for tw in time_windows[1:]
+        )
+        if has_tw:
+            with st.spinner("⚙️ Affinage de l'ordre selon les contraintes horaires…"):
+                trip2 = osrm_trip(coords_list, time_windows=time_windows, depart_min=depart_min)
+                if trip2:
+                    trip = trip2
 
         # Heures d'arrivée réelles
         arrivals = _compute_arrivals(trip["order"], trip["matrix"], depart_min, time_windows)
