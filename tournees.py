@@ -487,7 +487,7 @@ with st.sidebar:
 # ONGLETS
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("PROTOTYPE - Optimiseur de tournées")
+st.title("🚛 Optimiseur de Tournées — Assainissement")
 st.caption(f"🏭 Dépôt fixe : **{DEPOT_ADDRESS}**")
 
 tab_saisie, tab_optim, tab_export = st.tabs([
@@ -507,24 +507,56 @@ with tab_saisie:
         f"Départ et retour au dépôt (**{DEPOT_ADDRESS}**) sont automatiques. "
         f"L'ordre de saisie n'a pas d'importance.")
 
+    # ── Fusion des éditions en cours dans df_stops avant tout bouton ──
+    # On récupère les modifications du data_editor depuis son état interne
+    # (st.session_state["editor_stops"]) pour ne pas perdre les saisies.
+    def _flush_editor():
+        """Applique les édits en cours du tableau dans df_stops."""
+        key = "editor_stops"
+        if key not in st.session_state:
+            return
+        state = st.session_state[key]
+        df    = st.session_state.df_stops.copy()
+        # Éditions de cellules
+        for row_idx, cols in (state.get("edited_rows") or {}).items():
+            for col, val in cols.items():
+                df.at[int(row_idx), col] = val
+        # Lignes ajoutées via le "+" natif du data_editor
+        for row in (state.get("added_rows") or []):
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        # Lignes supprimées via la corbeille native
+        deleted = sorted(state.get("deleted_rows") or [], reverse=True)
+        for idx in deleted:
+            df = df.drop(index=idx).reset_index(drop=True)
+        st.session_state.df_stops = df
+
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("➕ Ajouter un arrêt", use_container_width=True):
-            new = pd.DataFrame({"Action": ["Nettoyer"], "Quantité": ["1 WC"],
-                                "Nom du client": [""], "Adresse": [""]})
+            _flush_editor()
+            new_row = pd.DataFrame({"Action": ["Nettoyer"], "Quantité": ["1 WC"],
+                                    "Nom du client": [""], "Adresse": [""]})
             st.session_state.df_stops = pd.concat(
-                [st.session_state.df_stops, new], ignore_index=True)
+                [st.session_state.df_stops, new_row], ignore_index=True)
+            # Reset l'état interne du data_editor pour repartir proprement
+            if "editor_stops" in st.session_state:
+                del st.session_state["editor_stops"]
             st.rerun()
     with c2:
         if st.button("➖ Supprimer le dernier", use_container_width=True):
+            _flush_editor()
             if len(st.session_state.df_stops) > 1:
                 st.session_state.df_stops = (
                     st.session_state.df_stops.iloc[:-1].reset_index(drop=True))
-                st.rerun()
+            if "editor_stops" in st.session_state:
+                del st.session_state["editor_stops"]
+            st.rerun()
     with c3:
         if st.button("🗑️ Tout vider", use_container_width=True, type="secondary"):
             st.session_state.df_stops = _init_df()
             st.session_state.result   = None
+            if "editor_stops" in st.session_state:
+                del st.session_state["editor_stops"]
             st.rerun()
 
     st.markdown("---")
@@ -536,7 +568,7 @@ with tab_saisie:
             unsafe_allow_html=True)
     st.markdown("")
 
-    edited = st.data_editor(
+    st.data_editor(
         st.session_state.df_stops,
         use_container_width=True,
         num_rows="dynamic",
@@ -556,16 +588,39 @@ with tab_saisie:
         hide_index=False,
         key="editor_stops",
     )
-    st.session_state.df_stops = edited
+    # Ne pas réécrire df_stops ici — c'est _flush_editor() qui le fait
+    # uniquement quand une action (bouton, optimisation) est déclenchée.
 
-    valid_rows = edited[edited["Adresse"].str.strip() != ""]
+    # Comptage des adresses valides en lisant l'état en temps réel
+    def _current_df():
+        """Retourne le df avec les éditions non encore flushées."""
+        key   = "editor_stops"
+        df    = st.session_state.df_stops.copy()
+        if key not in st.session_state:
+            return df
+        state = st.session_state[key]
+        for row_idx, cols in (state.get("edited_rows") or {}).items():
+            for col, val in cols.items():
+                df.at[int(row_idx), col] = val
+        for row in (state.get("added_rows") or []):
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        deleted = sorted(state.get("deleted_rows") or [], reverse=True)
+        for idx in deleted:
+            df = df.drop(index=idx).reset_index(drop=True)
+        return df
+
+    live_df    = _current_df()
+    valid_rows = live_df[live_df["Adresse"].fillna("").str.strip() != ""]
     n_valid    = len(valid_rows)
     st.caption(f"📍 **{n_valid}** arrêt(s) avec adresse renseignée")
     st.markdown("---")
 
     if st.button("🚀 Optimiser la tournée", type="primary",
                  use_container_width=True, disabled=(n_valid < 1)):
-        valid_stops = valid_rows.reset_index(drop=True)
+        _flush_editor()
+        valid_stops = st.session_state.df_stops[
+            st.session_state.df_stops["Adresse"].fillna("").str.strip() != ""
+        ].reset_index(drop=True)
 
         with st.spinner("🔍 Géocodage des adresses en cours…"):
             depot_coords = DEPOT_COORDS
