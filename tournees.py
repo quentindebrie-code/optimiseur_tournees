@@ -71,6 +71,7 @@ def _init_df():
         "Quantité":      ["1 WC",     "1 WC",     "1 WC"],
         "Nom du client": ["",         "",         ""],
         "Adresse":       ["",         "",         ""],
+        "Durée (min)":   [30,         30,         30],
         "Pas avant":     ["",         "",         ""],
         "Pas après":     ["",         "",         ""],
     })
@@ -135,23 +136,25 @@ def _fmt_min(minutes):
 def _compute_arrivals(tour, matrix, depart_min, time_windows):
     """
     Calcule l'heure d'arrivée réelle à chaque arrêt (en minutes depuis minuit),
-    en tenant compte des fenêtres temporelles.
+    en tenant compte des fenêtres temporelles et des durées d'intervention.
+    time_windows[i] contient aussi "duration" (durée intervention en minutes).
     Retourne une liste de dicts par arrêt (hors dépôt) :
-      arrival_min, wait_min, departure_min, tw_early, tw_late, violated
+      arrival_min, wait_min, departure_min, tw_early, tw_late, violated, duration_min
     """
     results      = []
     current_time = depart_min   # minutes depuis minuit
     current_idx  = tour[0]      # = 0 (dépôt)
 
     for step, next_idx in enumerate(tour[1:], 1):
-        travel_min   = (matrix[current_idx][next_idx] or 0) / 60
-        arrival_min  = current_time + travel_min
-        tw           = time_windows[next_idx]   # {"earliest": int|None, "latest": int|None}
-        earliest     = tw["earliest"]
-        latest       = tw["latest"]
-        wait_min     = 0
+        travel_min    = (matrix[current_idx][next_idx] or 0) / 60
+        arrival_min   = current_time + travel_min
+        tw            = time_windows[next_idx]
+        earliest      = tw["earliest"]
+        latest        = tw["latest"]
+        duration_min  = tw.get("duration", 0) or 0
+        wait_min      = 0
 
-        # Si on arrive trop tôt → on attend
+        # Si on arrive trop tôt → on attend jusqu'à l'ouverture
         if earliest is not None and arrival_min < earliest:
             wait_min    = earliest - arrival_min
             arrival_min = earliest
@@ -159,15 +162,19 @@ def _compute_arrivals(tour, matrix, depart_min, time_windows):
         # Violation : arrive après la limite latest
         violated = (latest is not None and arrival_min > latest)
 
+        # Départ de l'arrêt = arrivée + durée intervention
+        departure_min = arrival_min + duration_min
+
         results.append({
             "arrival_min":   arrival_min,
             "wait_min":      wait_min,
-            "departure_min": arrival_min,   # pas de durée d'intervention modélisée
+            "departure_min": departure_min,
             "tw_early":      earliest,
             "tw_late":       latest,
             "violated":      violated,
+            "duration_min":  duration_min,
         })
-        current_time = arrival_min
+        current_time = departure_min   # on repart après l'intervention
         current_idx  = next_idx
 
     return results
@@ -382,7 +389,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         ws.cell(r, 2).alignment = left
     ws.append([])
 
-    headers = ["Ordre", "Action", "Quantité", "Nom du client", "Adresse", "Pas avant", "Pas après", "Arrivée estimée", "✓ Fait"]
+    headers = ["Ordre", "Action", "Quantité", "Nom du client", "Adresse", "Durée (min)", "Pas avant", "Pas après", "Arrivée", "Départ", "✓ Fait"]
     ws.append(headers)
     hr = ws.max_row
     for col, h in enumerate(headers, 1):
@@ -394,30 +401,32 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
     for stop in result["stops_ordered"]:
         ws.append([stop["order_num"], stop["action"], stop["quantity"],
                    stop["client"] or "", stop["address"],
+                   stop.get("duration_min", ""),
                    _fmt_min(stop.get("tw_early")),
                    _fmt_min(stop.get("tw_late")),
                    _fmt_min(stop.get("arrival_min")),
+                   _fmt_min(stop.get("departure_min")),
                    ""])
         r = ws.max_row
-        for col in range(1, 10):
+        for col in range(1, 12):
             c = ws.cell(r, col)
             c.border = brd
             c.alignment = center if col != 5 else left
-            if col == 8 and stop.get("violated"):
+            if col == 9 and stop.get("violated"):
                 c.font = Font(bold=True, color="DC3545")
         ws.cell(r, 2).fill = action_fills.get(stop["action"],
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
 
-    ws.append(["↩", "Retour dépôt", "", "", DEPOT_ADDRESS, "", "", "", ""])
+    ws.append(["↩", "Retour dépôt", "", "", DEPOT_ADDRESS, "", "", "", "", "", ""])
     r = ws.max_row
-    for col in range(1, 10):
+    for col in range(1, 12):
         c = ws.cell(r, col)
         c.fill = PatternFill("solid", fgColor="FFF3CD")
         c.font = bold_f; c.border = brd
         c.alignment = center if col != 5 else left
 
-    for col, width in zip(range(1, 10), [8, 14, 14, 22, 44, 12, 12, 14, 8]):
+    for col, width in zip(range(1, 12), [8, 14, 14, 22, 44, 12, 12, 12, 12, 12, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
     buf = BytesIO()
@@ -484,11 +493,11 @@ def export_pdf(result, tour_date, driver_name):
         "Retirer":  colors.HexColor("#F4B8C1"),
     }
 
-    table_data = [["N°", "Action", "Quantité", "Client", "Adresse", "Pas avant", "Pas après", "Arrivée"]]
+    table_data = [["N°", "Action", "Qté", "Client", "Adresse", "Durée", "Pas avant", "Pas après", "Arrivée", "Départ"]]
     row_styles = []
 
     # Ligne dépôt départ
-    table_data.append(["", "Dépôt – Départ", "", "", DEPOT_ADDRESS, "", "", _fmt_min(result.get("depart_min")) or ""])
+    table_data.append(["", "Dépôt – Départ", "", "", DEPOT_ADDRESS, "", "", "", _fmt_min(result.get("depart_min")) or "", ""])
     row_styles += [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#FFF3CD")),
                    ("FONTNAME",   (0, 1), (-1, 1), "Helvetica-Bold")]
 
@@ -496,23 +505,25 @@ def export_pdf(result, tour_date, driver_name):
         arr_str = _fmt_min(stop.get("arrival_min")) or ""
         table_data.append([str(stop["order_num"]), stop["action"],
                            stop["quantity"], stop["client"] or "", stop["address"],
+                           str(stop.get("duration_min", "") or ""),
                            _fmt_min(stop.get("tw_early")) or "",
                            _fmt_min(stop.get("tw_late")) or "",
-                           arr_str])
+                           arr_str,
+                           _fmt_min(stop.get("departure_min")) or ""])
         ri = i + 2
         bg = action_bg.get(stop["action"], colors.HexColor("#F0F0F0"))
         row_styles.append(("BACKGROUND", (1, ri), (1, ri), bg))
         if stop.get("violated"):
-            row_styles.append(("TEXTCOLOR", (7, ri), (7, ri), colors.HexColor("#DC3545")))
-            row_styles.append(("FONTNAME",  (7, ri), (7, ri), "Helvetica-Bold"))
+            row_styles.append(("TEXTCOLOR", (8, ri), (8, ri), colors.HexColor("#DC3545")))
+            row_styles.append(("FONTNAME",  (8, ri), (8, ri), "Helvetica-Bold"))
 
     # Ligne dépôt retour
-    table_data.append(["", "Dépôt – Retour", "", "", DEPOT_ADDRESS, "", "", _fmt_min(result.get("return_min")) or ""])
+    table_data.append(["", "Dépôt – Retour", "", "", DEPOT_ADDRESS, "", "", "", "", _fmt_min(result.get("return_min")) or ""])
     last = len(table_data) - 1
     row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD")),
                    ("FONTNAME",   (0, last), (-1, last), "Helvetica-Bold")]
 
-    stops_table = Table(table_data, colWidths=[8*mm, 24*mm, 20*mm, 26*mm, 60*mm, 16*mm, 16*mm, 16*mm],
+    stops_table = Table(table_data, colWidths=[7*mm, 22*mm, 14*mm, 22*mm, 52*mm, 13*mm, 14*mm, 14*mm, 14*mm, 14*mm],
                         repeatRows=1)
     base_style = [
         ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
@@ -691,6 +702,10 @@ with tab_saisie:
             "Adresse": st.column_config.TextColumn(
                 "Adresse complète (rue, ville, CP)", width="large",
                 help="Ex : Place d'Hautpoul 81600 Gaillac"),
+            "Durée (min)": st.column_config.NumberColumn(
+                "⏱ Durée (min)", width="small", min_value=1, max_value=480,
+                step=5, default=30,
+                help="Durée de l'intervention sur place en minutes (ex: 30)"),
             "Pas avant": st.column_config.TextColumn(
                 "⏰ Pas avant", width="small",
                 help="Arriver au plus tôt à cette heure (format HH:MM). Ex : 09:00"),
@@ -763,12 +778,17 @@ with tab_saisie:
 
         # Fenêtres temporelles (index 0 = dépôt, pas de contrainte)
         depart_min  = st.session_state.heure_depart.hour * 60 + st.session_state.heure_depart.minute
-        time_windows = [{"earliest": None, "latest": None}]  # index 0 = dépôt
+        time_windows = [{"earliest": None, "latest": None, "duration": 0}]  # index 0 = dépôt
         for _, row in valid_stops.iterrows():
             if geo.get(row["Adresse"]):
+                try:
+                    dur = int(float(row.get("Durée (min)", 30) or 30))
+                except (ValueError, TypeError):
+                    dur = 30
                 time_windows.append({
                     "earliest": _parse_hhmm(row.get("Pas avant", "")),
                     "latest":   _parse_hhmm(row.get("Pas après", "")),
+                    "duration": dur,
                 })
 
         with st.spinner("🗺️ Calcul de l'itinéraire optimisé…"):
@@ -793,19 +813,25 @@ with tab_saisie:
             row    = valid_stops.iloc[sri]
             coords = geo.get(row["Adresse"])
             arr    = arrivals[arr_idx] if arr_idx < len(arrivals) else {}
+            try:
+                dur_stop = int(float(row.get("Durée (min)", 30) or 30))
+            except (ValueError, TypeError):
+                dur_stop = 30
             stops_ordered.append({
-                "order_num":   rank,
-                "action":      row["Action"],
-                "quantity":    row["Quantité"],
-                "client":      row["Nom du client"],
-                "address":     row["Adresse"],
-                "lat":         coords[0] if coords else None,
-                "lon":         coords[1] if coords else None,
-                "tw_early":    _parse_hhmm(row.get("Pas avant", "")),
-                "tw_late":     _parse_hhmm(row.get("Pas après", "")),
-                "arrival_min": arr.get("arrival_min"),
-                "wait_min":    arr.get("wait_min", 0),
-                "violated":    arr.get("violated", False),
+                "order_num":    rank,
+                "action":       row["Action"],
+                "quantity":     row["Quantité"],
+                "client":       row["Nom du client"],
+                "address":      row["Adresse"],
+                "lat":          coords[0] if coords else None,
+                "lon":          coords[1] if coords else None,
+                "tw_early":     _parse_hhmm(row.get("Pas avant", "")),
+                "tw_late":      _parse_hhmm(row.get("Pas après", "")),
+                "duration_min": dur_stop,
+                "arrival_min":  arr.get("arrival_min"),
+                "departure_min":arr.get("departure_min"),
+                "wait_min":     arr.get("wait_min", 0),
+                "violated":     arr.get("violated", False),
             })
             rank    += 1
             arr_idx += 1
@@ -830,7 +856,7 @@ with tab_saisie:
             st.warning("  \n".join(lines))
 
         return_min = (
-            (stops_ordered[-1]["arrival_min"] or depart_min)
+            (stops_ordered[-1]["departure_min"] or stops_ordered[-1]["arrival_min"] or depart_min)
             + (trip["matrix"][order[-1]][order[0]] or 0) / 60
         ) if stops_ordered else depart_min
 
@@ -874,6 +900,19 @@ with tab_optim:
         c7.metric("🕖 Départ dépôt",   _fmt_min(r.get("depart_min")))
         c8.metric("🏁 Retour dépôt",   _fmt_min(r.get("return_min")))
 
+        # Durée totale (trajet + toutes les interventions)
+        if r.get("depart_min") is not None and r.get("return_min") is not None:
+            total_tour_min = r["return_min"] - r["depart_min"]
+            h_tot = int(total_tour_min // 60)
+            m_tot = int(total_tour_min % 60)
+            interv_total = sum(s.get("duration_min", 0) for s in r["stops_ordered"])
+            st.info(
+                f"🗓️ **Durée totale de la tournée** (trajet + interventions) : "
+                f"**{h_tot}h{m_tot:02d}** "
+                f"— dont {int(r['duration_min'])} min de trajet "
+                f"et {interv_total} min d'interventions"
+            )
+
         st.markdown("---")
         col_map, col_list = st.columns([3, 2])
 
@@ -907,8 +946,12 @@ with tab_optim:
                 violated = stop.get("violated", False)
                 arr_color = "#dc3545" if violated else "#28a745"
                 arr_icon  = "⚠️" if violated else "🕐"
+                dep_str  = _fmt_min(stop.get("departure_min"))
+                dur_str  = stop.get("duration_min", 0)
+                dur_html = (f" <small style='color:#555'>(intervention : {dur_str} min → départ {dep_str})</small>"
+                            if dur_str and dep_str else "")
                 arr_html  = (f"<br><small style='color:{arr_color};font-weight:600'>"
-                             f"{arr_icon} Arrivée estimée : {arr_str}</small>{wait_html}"
+                             f"{arr_icon} Arrivée estimée : {arr_str}</small>{wait_html}{dur_html}"
                              if arr_str else "")
                 st.markdown(
                     f'<div class="stop-card" style="background:{bg};'
