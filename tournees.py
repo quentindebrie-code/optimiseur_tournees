@@ -682,7 +682,7 @@ tab_saisie, tab_optim, tab_export = st.tabs([
 with tab_saisie:
     st.subheader("Saisie des arrêts de la tournée")
     st.info(
-        f"NOTICE D'UTILISATION DE L'OPTIMISEUR DE TOURNÉES : <br>"
+        f"NOTICE D'UTILISATION DE L'OPTIMISEUR DE TOURNÉES : "
         f"Tout départ et retour est à l'adresse suivante : (**{DEPOT_ADDRESS}**). "
         f"L'ordre de saisie des zones d'intervention n'a pas d'importance. L'outil se charge de l'optimisation automatique.")
 
