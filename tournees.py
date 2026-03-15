@@ -76,7 +76,8 @@ def _init_df():
         "Pas après":     ["",         "",         ""],
     })
 
-if "df_stops"     not in st.session_state: st.session_state.df_stops     = _init_df()
+if "df_stops"        not in st.session_state: st.session_state.df_stops        = _init_df()
+if "heure_min_depart" not in st.session_state: st.session_state.heure_min_depart = datetime.time(7, 0)
 if "result"       not in st.session_state: st.session_state.result       = None
 if "tour_date"    not in st.session_state: st.session_state.tour_date    = datetime.date.today()
 if "driver"       not in st.session_state: st.session_state.driver       = ""
@@ -619,6 +620,26 @@ with st.sidebar:
         "👤 Chauffeur", value=st.session_state.driver,
         placeholder="ex : Jean Dupont")
     st.divider()
+    st.subheader("⚖️ Règles de travail")
+    st.session_state.heure_min_depart = st.time_input(
+        "🕖 Départ au plus tôt",
+        value=st.session_state.heure_min_depart,
+        step=300,
+        help=(
+            "Heure minimale de départ du dépôt. "
+            "En France, le Code du travail impose un repos quotidien de 11h consécutives "
+            "(art. L3131-1) et le transport routier interdit le travail avant 5h00 "
+            "dans la plupart des conventions collectives. "
+            "Valeur recommandée : 07h00."
+        )
+    )
+    st.caption(
+        "ℹ️ *Code du travail — art. L3131-1 :* "
+        "repos quotidien minimum de **11h consécutives**. "
+        "Convention collective transport : départ rarement avant **06h00**."
+    )
+
+    st.divider()
     st.subheader("🚛 Véhicule")
     fuel_conso = st.number_input(
         "Consommation (L/100 km)", min_value=5.0, max_value=30.0,
@@ -837,22 +858,41 @@ with tab_saisie:
                 st.stop()
             orig = osrm_route_distance(coords_list)
 
-        # Calcul automatique de l'heure de départ optimale
+        # Borne légale / réglementaire configurée dans la sidebar
+        legal_min = (st.session_state.heure_min_depart.hour * 60
+                     + st.session_state.heure_min_depart.minute)
+
+        # Calcul automatique de l'heure de départ optimale (purement mathématique)
         depart_min_opt = _compute_optimal_departure(trip["order"], trip["matrix"], time_windows)
 
         if depart_min_opt is not None:
-            depart_min = depart_min_opt
-            st.info(
-                f"🕖 **Heure de départ recommandée du dépôt : {_fmt_min(depart_min)}** "
-                f"— calculée automatiquement pour respecter toutes les contraintes "
-                f"avec le minimum d'attente."
-            )
+            depart_min_raw = depart_min_opt   # résultat pur sans contrainte légale
+
+            if depart_min_raw < legal_min:
+                # Le calcul pur tomberait avant l'heure légale → on clamp
+                depart_min = legal_min
+                st.warning(
+                    f"⚠️ Le calcul théorique suggérait un départ à **{_fmt_min(depart_min_raw)}**, "
+                    f"ce qui ne respecte pas l'heure de départ au plus tôt fixée à "
+                    f"**{_fmt_min(legal_min)}**. "
+                    f"Le départ est donc fixé à **{_fmt_min(depart_min)}**. "
+                    f"Certaines contraintes client marquées 'Pas après' risquent de ne pas "
+                    f"pouvoir être respectées — vérifiez les arrêts en rouge ci-dessous."
+                )
+            else:
+                depart_min = depart_min_raw
+                st.success(
+                    f"🕖 **Heure de départ recommandée : {_fmt_min(depart_min)}** "
+                    f"— calculée automatiquement pour respecter toutes les contraintes "
+                    f"avec le minimum d'attente (départ légal : {_fmt_min(legal_min)})."
+                )
         else:
-            # Aucune contrainte : on part à 07h30 par défaut
-            depart_min = 7 * 60 + 30
+            # Aucune contrainte client : on part à l'heure légale minimale
+            depart_min = legal_min
             st.info(
-                "🕖 **Aucune contrainte horaire renseignée.** "
-                f"Heure de départ par défaut : **{_fmt_min(depart_min)}**"
+                f"🕖 **Aucune contrainte horaire client renseignée.** "
+                f"Heure de départ : **{_fmt_min(depart_min)}** "
+                f"(heure légale minimale configurée)."
             )
 
         # Seconde passe 2-opt avec l'heure de départ calculée (affine si TW présentes)
