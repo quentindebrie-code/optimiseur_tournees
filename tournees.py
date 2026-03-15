@@ -71,12 +71,15 @@ def _init_df():
         "Quantité":      ["1 WC",     "1 WC",     "1 WC"],
         "Nom du client": ["",         "",         ""],
         "Adresse":       ["",         "",         ""],
+        "Pas avant":     ["",         "",         ""],
+        "Pas après":     ["",         "",         ""],
     })
 
-if "df_stops"  not in st.session_state: st.session_state.df_stops  = _init_df()
-if "result"    not in st.session_state: st.session_state.result    = None
-if "tour_date" not in st.session_state: st.session_state.tour_date = datetime.date.today()
-if "driver"    not in st.session_state: st.session_state.driver    = ""
+if "df_stops"     not in st.session_state: st.session_state.df_stops     = _init_df()
+if "result"       not in st.session_state: st.session_state.result       = None
+if "tour_date"    not in st.session_state: st.session_state.tour_date    = datetime.date.today()
+if "driver"       not in st.session_state: st.session_state.driver       = ""
+if "heure_depart" not in st.session_state: st.session_state.heure_depart = datetime.time(7, 30)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCODAGE – API Adresse gouv.fr + fallback Nominatim
@@ -108,34 +111,119 @@ def geocode(address: str):
 # ROUTAGE OSRM
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _tour_cost(tour, matrix):
-    """Cout total d'un tour (duree) + retour au depot."""
-    cost = sum(matrix[tour[i]][tour[i + 1]] for i in range(len(tour) - 1))
-    cost += matrix[tour[-1]][tour[0]]
-    return cost
+def _parse_hhmm(s):
+    """Convertit 'HH:MM' en minutes depuis minuit, ou None si vide/invalide."""
+    if not s or not str(s).strip():
+        return None
+    s = str(s).strip()
+    try:
+        h, m = s.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
 
 
-def _two_opt(tour, matrix):
-    """Amelioration 2-opt : echange de segments jusqu'a convergence."""
-    best = tour[:]
+def _fmt_min(minutes):
+    """Convertit des minutes depuis minuit en chaîne HH:MM."""
+    if minutes is None:
+        return ""
+    h = int(minutes) // 60
+    m = int(minutes) % 60
+    return f"{h:02d}:{m:02d}"
+
+
+def _compute_arrivals(tour, matrix, depart_min, time_windows):
+    """
+    Calcule l'heure d'arrivée réelle à chaque arrêt (en minutes depuis minuit),
+    en tenant compte des fenêtres temporelles.
+    Retourne une liste de dicts par arrêt (hors dépôt) :
+      arrival_min, wait_min, departure_min, tw_early, tw_late, violated
+    """
+    results      = []
+    current_time = depart_min   # minutes depuis minuit
+    current_idx  = tour[0]      # = 0 (dépôt)
+
+    for step, next_idx in enumerate(tour[1:], 1):
+        travel_min   = (matrix[current_idx][next_idx] or 0) / 60
+        arrival_min  = current_time + travel_min
+        tw           = time_windows[next_idx]   # {"earliest": int|None, "latest": int|None}
+        earliest     = tw["earliest"]
+        latest       = tw["latest"]
+        wait_min     = 0
+
+        # Si on arrive trop tôt → on attend
+        if earliest is not None and arrival_min < earliest:
+            wait_min    = earliest - arrival_min
+            arrival_min = earliest
+
+        # Violation : arrive après la limite latest
+        violated = (latest is not None and arrival_min > latest)
+
+        results.append({
+            "arrival_min":   arrival_min,
+            "wait_min":      wait_min,
+            "departure_min": arrival_min,   # pas de durée d'intervention modélisée
+            "tw_early":      earliest,
+            "tw_late":       latest,
+            "violated":      violated,
+        })
+        current_time = arrival_min
+        current_idx  = next_idx
+
+    return results
+
+
+def _tour_cost_tw(tour, matrix, depart_min, time_windows):
+    """
+    Coût total tenant compte des fenêtres temporelles.
+    Temps de trajet + attentes + pénalité forte pour violations.
+    """
+    PENALTY = 1e6   # pénalité par minute de dépassement
+    arrivals = _compute_arrivals(tour, matrix, depart_min, time_windows)
+    # Durée totale jusqu'au dernier arrêt + retour dépôt
+    if not arrivals:
+        return 0
+    last_departure = arrivals[-1]["departure_min"]
+    back_min = (matrix[tour[-1]][tour[0]] or 0) / 60
+    total_time = (last_departure + back_min) - depart_min
+
+    # Pénalités pour violations
+    penalty = 0
+    for a in arrivals:
+        if a["violated"] and a["tw_late"] is not None:
+            penalty += (a["arrival_min"] - a["tw_late"]) * PENALTY
+
+    return total_time + penalty
+
+
+def _two_opt(tour, matrix, depart_min=None, time_windows=None):
+    """Amelioration 2-opt avec prise en compte optionnelle des fenêtres temporelles."""
+    use_tw = depart_min is not None and time_windows is not None
+    def cost(t):
+        if use_tw:
+            return _tour_cost_tw(t, matrix, depart_min, time_windows)
+        total = sum(matrix[t[i]][t[i+1]] for i in range(len(t)-1))
+        return total + matrix[t[-1]][t[0]]
+
+    best     = tour[:]
     improved = True
     while improved:
         improved = False
         for i in range(1, len(best) - 1):
             for j in range(i + 1, len(best)):
-                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
-                if _tour_cost(candidate, matrix) < _tour_cost(best, matrix):
-                    best = candidate
+                candidate = best[:i] + best[i:j+1][::-1] + best[j+1:]
+                if cost(candidate) < cost(best):
+                    best     = candidate
                     improved = True
     return best
 
 
-def osrm_trip(coords_latlon):
+def osrm_trip(coords_latlon, time_windows=None, depart_min=None):
     """
-    Optimisation TSP depot fixe :
+    Optimisation TSP depot fixe avec fenêtres temporelles optionnelles.
     1. Matrice de durees OSRM (/table)
     2. Nearest-neighbor depuis le depot (index 0)
-    3. Amelioration 2-opt
+    3. Amelioration 2-opt (avec TW si fournis)
     4. Route finale (/route) pour geometrie et distances reelles
     """
     n         = len(coords_latlon)
@@ -165,8 +253,8 @@ def osrm_trip(coords_latlon):
         unvisited.remove(nearest)
         current = nearest
 
-    # Etape 3 : amelioration 2-opt
-    tour = _two_opt(tour, matrix)
+    # Etape 3 : amelioration 2-opt (avec TW si fournis)
+    tour = _two_opt(tour, matrix, depart_min=depart_min, time_windows=time_windows)
 
     # Etape 4 : route reelle pour geometrie et distances
     tour_with_return = tour + [tour[0]]
@@ -193,6 +281,7 @@ def osrm_trip(coords_latlon):
         "distance_km":  route["distance"] / 1000,
         "duration_min": route["duration"] / 60,
         "geometry":     geom,
+        "matrix":       matrix,
     }
 
 
@@ -293,7 +382,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         ws.cell(r, 2).alignment = left
     ws.append([])
 
-    headers = ["Ordre", "Action", "Quantité", "Nom du client", "Adresse", "Heure passage", "✓ Fait"]
+    headers = ["Ordre", "Action", "Quantité", "Nom du client", "Adresse", "Pas avant", "Pas après", "Arrivée estimée", "✓ Fait"]
     ws.append(headers)
     hr = ws.max_row
     for col, h in enumerate(headers, 1):
@@ -304,25 +393,31 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
 
     for stop in result["stops_ordered"]:
         ws.append([stop["order_num"], stop["action"], stop["quantity"],
-                   stop["client"] or "", stop["address"], "", ""])
+                   stop["client"] or "", stop["address"],
+                   _fmt_min(stop.get("tw_early")),
+                   _fmt_min(stop.get("tw_late")),
+                   _fmt_min(stop.get("arrival_min")),
+                   ""])
         r = ws.max_row
-        for col in range(1, 8):
+        for col in range(1, 10):
             c = ws.cell(r, col)
             c.border = brd
             c.alignment = center if col != 5 else left
+            if col == 8 and stop.get("violated"):
+                c.font = Font(bold=True, color="DC3545")
         ws.cell(r, 2).fill = action_fills.get(stop["action"],
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
 
-    ws.append(["↩", "Retour dépôt", "", "", DEPOT_ADDRESS, "", ""])
+    ws.append(["↩", "Retour dépôt", "", "", DEPOT_ADDRESS, "", "", "", ""])
     r = ws.max_row
-    for col in range(1, 8):
+    for col in range(1, 10):
         c = ws.cell(r, col)
         c.fill = PatternFill("solid", fgColor="FFF3CD")
         c.font = bold_f; c.border = brd
         c.alignment = center if col != 5 else left
 
-    for col, width in zip(range(1, 8), [8, 14, 14, 22, 44, 16, 8]):
+    for col, width in zip(range(1, 10), [8, 14, 14, 22, 44, 12, 12, 14, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
     buf = BytesIO()
@@ -389,28 +484,35 @@ def export_pdf(result, tour_date, driver_name):
         "Retirer":  colors.HexColor("#F4B8C1"),
     }
 
-    table_data = [["N°", "Action", "Quantité", "Client", "Adresse"]]
+    table_data = [["N°", "Action", "Quantité", "Client", "Adresse", "Pas avant", "Pas après", "Arrivée"]]
     row_styles = []
 
     # Ligne dépôt départ
-    table_data.append(["", "Dépôt – Départ", "", "", DEPOT_ADDRESS])
+    table_data.append(["", "Dépôt – Départ", "", "", DEPOT_ADDRESS, "", "", _fmt_min(result.get("depart_min")) or ""])
     row_styles += [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#FFF3CD")),
                    ("FONTNAME",   (0, 1), (-1, 1), "Helvetica-Bold")]
 
     for i, stop in enumerate(result["stops_ordered"]):
+        arr_str = _fmt_min(stop.get("arrival_min")) or ""
         table_data.append([str(stop["order_num"]), stop["action"],
-                           stop["quantity"], stop["client"] or "", stop["address"]])
+                           stop["quantity"], stop["client"] or "", stop["address"],
+                           _fmt_min(stop.get("tw_early")) or "",
+                           _fmt_min(stop.get("tw_late")) or "",
+                           arr_str])
         ri = i + 2
         bg = action_bg.get(stop["action"], colors.HexColor("#F0F0F0"))
         row_styles.append(("BACKGROUND", (1, ri), (1, ri), bg))
+        if stop.get("violated"):
+            row_styles.append(("TEXTCOLOR", (7, ri), (7, ri), colors.HexColor("#DC3545")))
+            row_styles.append(("FONTNAME",  (7, ri), (7, ri), "Helvetica-Bold"))
 
     # Ligne dépôt retour
-    table_data.append(["", "Dépôt – Retour", "", "", DEPOT_ADDRESS])
+    table_data.append(["", "Dépôt – Retour", "", "", DEPOT_ADDRESS, "", "", _fmt_min(result.get("return_min")) or ""])
     last = len(table_data) - 1
     row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD")),
                    ("FONTNAME",   (0, last), (-1, last), "Helvetica-Bold")]
 
-    stops_table = Table(table_data, colWidths=[10*mm, 28*mm, 24*mm, 32*mm, 83*mm],
+    stops_table = Table(table_data, colWidths=[8*mm, 24*mm, 20*mm, 26*mm, 60*mm, 16*mm, 16*mm, 16*mm],
                         repeatRows=1)
     base_style = [
         ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
@@ -459,6 +561,11 @@ with st.sidebar:
     st.session_state.driver = st.text_input(
         "👤 Chauffeur", value=st.session_state.driver,
         placeholder="ex : Jean Dupont")
+    st.session_state.heure_depart = st.time_input(
+        "🕖 Heure de départ du dépôt",
+        value=st.session_state.heure_depart,
+        step=300,
+        help="Heure à laquelle le chauffeur quitte le dépôt")
 
     st.divider()
     st.subheader("🚛 Véhicule")
@@ -584,6 +691,12 @@ with tab_saisie:
             "Adresse": st.column_config.TextColumn(
                 "Adresse complète (rue, ville, CP)", width="large",
                 help="Ex : Place d'Hautpoul 81600 Gaillac"),
+            "Pas avant": st.column_config.TextColumn(
+                "⏰ Pas avant", width="small",
+                help="Arriver au plus tôt à cette heure (format HH:MM). Ex : 09:00"),
+            "Pas après": st.column_config.TextColumn(
+                "⏰ Pas après", width="small",
+                help="Arriver au plus tard à cette heure (format HH:MM). Ex : 11:30"),
         },
         hide_index=False,
         key="editor_stops",
@@ -648,15 +761,29 @@ with tab_saisie:
             st.error("❌ Aucune adresse valide après géocodage.")
             st.stop()
 
+        # Fenêtres temporelles (index 0 = dépôt, pas de contrainte)
+        depart_min  = st.session_state.heure_depart.hour * 60 + st.session_state.heure_depart.minute
+        time_windows = [{"earliest": None, "latest": None}]  # index 0 = dépôt
+        for _, row in valid_stops.iterrows():
+            if geo.get(row["Adresse"]):
+                time_windows.append({
+                    "earliest": _parse_hhmm(row.get("Pas avant", "")),
+                    "latest":   _parse_hhmm(row.get("Pas après", "")),
+                })
+
         with st.spinner("🗺️ Calcul de l'itinéraire optimisé…"):
-            trip = osrm_trip(coords_list)
+            trip = osrm_trip(coords_list, time_windows=time_windows, depart_min=depart_min)
             if not trip:
                 st.stop()
             orig = osrm_route_distance(coords_list)
 
+        # Heures d'arrivée réelles
+        arrivals = _compute_arrivals(trip["order"], trip["matrix"], depart_min, time_windows)
+
         order         = trip["order"]
         stops_ordered = []
         rank          = 1
+        arr_idx       = 0
         for orig_idx in order:
             if orig_idx == 0:
                 continue
@@ -665,16 +792,23 @@ with tab_saisie:
                 continue
             row    = valid_stops.iloc[sri]
             coords = geo.get(row["Adresse"])
+            arr    = arrivals[arr_idx] if arr_idx < len(arrivals) else {}
             stops_ordered.append({
-                "order_num": rank,
-                "action":    row["Action"],
-                "quantity":  row["Quantité"],
-                "client":    row["Nom du client"],
-                "address":   row["Adresse"],
-                "lat":       coords[0] if coords else None,
-                "lon":       coords[1] if coords else None,
+                "order_num":   rank,
+                "action":      row["Action"],
+                "quantity":    row["Quantité"],
+                "client":      row["Nom du client"],
+                "address":     row["Adresse"],
+                "lat":         coords[0] if coords else None,
+                "lon":         coords[1] if coords else None,
+                "tw_early":    _parse_hhmm(row.get("Pas avant", "")),
+                "tw_late":     _parse_hhmm(row.get("Pas après", "")),
+                "arrival_min": arr.get("arrival_min"),
+                "wait_min":    arr.get("wait_min", 0),
+                "violated":    arr.get("violated", False),
             })
-            rank += 1
+            rank    += 1
+            arr_idx += 1
 
         dist_km   = trip["distance_km"]
         dur_min   = trip["duration_min"]
@@ -683,16 +817,35 @@ with tab_saisie:
         km_saved  = max(0, (orig["distance_km"]  - dist_km))  if orig else 0
         min_saved = max(0, (orig["duration_min"] - dur_min)) if orig else 0
 
+        # Avertissements fenêtres non respectables
+        violated_stops = [s for s in stops_ordered if s["violated"]]
+        if violated_stops:
+            lines = ["⚠️ Certaines contraintes horaires ne peuvent pas être respectées :"]
+            for s in violated_stops:
+                lines.append(
+                    f"- **Arrêt {s['order_num']}** {s['address']} : "
+                    f"arrivée estimée {_fmt_min(s['arrival_min'])} "
+                    f"(limite : {_fmt_min(s['tw_late'])})"
+                )
+            st.warning("  \n".join(lines))
+
+        return_min = (
+            (stops_ordered[-1]["arrival_min"] or depart_min)
+            + (trip["matrix"][order[-1]][order[0]] or 0) / 60
+        ) if stops_ordered else depart_min
+
         st.session_state.result = {
-            "stops_ordered": stops_ordered,
-            "distance_km":   dist_km,
-            "duration_min":  dur_min,
-            "fuel_liters":   fuel_l,
-            "fuel_cost":     fuel_cost,
-            "km_saved":      km_saved,
-            "time_saved_min":min_saved,
-            "geometry":      trip["geometry"],
-            "depot_coords":  depot_coords,
+            "stops_ordered":  stops_ordered,
+            "distance_km":    dist_km,
+            "duration_min":   dur_min,
+            "fuel_liters":    fuel_l,
+            "fuel_cost":      fuel_cost,
+            "km_saved":       km_saved,
+            "time_saved_min": min_saved,
+            "geometry":       trip["geometry"],
+            "depot_coords":   depot_coords,
+            "depart_min":     depart_min,
+            "return_min":     return_min,
         }
         st.success("✅ Tournée optimisée ! Consultez l'onglet **Tournée optimisée**.")
         st.rerun()
@@ -710,7 +863,7 @@ with tab_optim:
         mins  = int(r["duration_min"] % 60)
 
         st.subheader("📊 Récapitulatif de la tournée optimisée")
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
         c1.metric("📍 Arrêts",        len(r["stops_ordered"]))
         c2.metric("🛣️ Distance",       f"{r['distance_km']:.1f} km")
         c3.metric("⏱️ Durée trajet",   f"{hours}h{mins:02d}")
@@ -718,6 +871,8 @@ with tab_optim:
         c5.metric("💶 Coût carburant", f"{r['fuel_cost']:.2f} €")
         c6.metric("⏳ Temps gagné",    f"{int(r['time_saved_min'])} min",
                   delta=f"-{r['km_saved']:.1f} km", delta_color="inverse")
+        c7.metric("🕖 Départ dépôt",   _fmt_min(r.get("depart_min")))
+        c8.metric("🏁 Retour dépôt",   _fmt_min(r.get("return_min")))
 
         st.markdown("---")
         col_map, col_list = st.columns([3, 2])
@@ -736,16 +891,40 @@ with tab_optim:
                 bg  = ACTION_COLORS.get(stop["action"], "#f0f0f0")
                 brd = ACTION_BORDER_COLORS.get(stop["action"], "#999")
                 cli = f" · {stop['client']}" if stop['client'] else ""
+                # Contrainte horaire
+                tw_parts = []
+                if stop.get("tw_early"):
+                    tw_parts.append(f"⏰ Pas avant {_fmt_min(stop['tw_early'])}")
+                if stop.get("tw_late"):
+                    tw_parts.append(f"⏰ Pas après {_fmt_min(stop['tw_late'])}")
+                tw_html = (f"<br><small style='color:#666'>"
+                           + " · ".join(tw_parts) + "</small>") if tw_parts else ""
+                # Heure d'arrivée estimée
+                arr_str = _fmt_min(stop.get("arrival_min"))
+                wait    = stop.get("wait_min", 0)
+                wait_html = (f" <small style='color:#999'>(attente {int(wait)} min)</small>"
+                             if wait and wait > 0.5 else "")
+                violated = stop.get("violated", False)
+                arr_color = "#dc3545" if violated else "#28a745"
+                arr_icon  = "⚠️" if violated else "🕐"
+                arr_html  = (f"<br><small style='color:{arr_color};font-weight:600'>"
+                             f"{arr_icon} Arrivée estimée : {arr_str}</small>{wait_html}"
+                             if arr_str else "")
                 st.markdown(
                     f'<div class="stop-card" style="background:{bg};'
                     f'border-left:4px solid {brd};">'
                     f'<b>#{stop["order_num"]} {stop["action"]}</b>{cli}<br>'
                     f'<small>📍 {stop["address"]}</small><br>'
-                    f'<small>📦 {stop["quantity"]}</small></div>',
+                    f'<small>📦 {stop["quantity"]}</small>'
+                    f'{tw_html}{arr_html}</div>',
                     unsafe_allow_html=True)
+            retour_str = _fmt_min(r.get("return_min"))
+            retour_html = (f"<br><small style='color:#1f4e79;font-weight:600'>🏁 Retour estimé : {retour_str}</small>"
+                           if retour_str else "")
             st.markdown(
                 f'<div class="stop-card depot-card"><b>🏭 Dépôt — Retour</b><br>'
-                f'<small>{DEPOT_ADDRESS}</small></div>', unsafe_allow_html=True)
+                f'<small>{DEPOT_ADDRESS}</small>{retour_html}</div>',
+                unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ONGLET 3 — EXPORT
