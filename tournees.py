@@ -682,9 +682,9 @@ tab_saisie, tab_optim, tab_export = st.tabs([
 with tab_saisie:
     st.subheader("Saisie des arrêts de la tournée")
     st.info(
-        f"💡 Saisissez vos arrêts ci-dessous. "
-        f"Départ et retour au dépôt (**{DEPOT_ADDRESS}**) sont automatiques. "
-        f"L'ordre de saisie n'a pas d'importance.")
+        f"NOTICE D'UTILISATION DE L'OPTIMISEUR DE TOURNÉES : "
+        f"Tout départ et retour est à l'adresse suivante : (**{DEPOT_ADDRESS}**). "
+        f"L'ordre de saisie des zones d'intervention n'a pas d'importance. L'outil se charge de l'optimisation automatique.")
 
     # ── Fusion des éditions en cours dans df_stops avant tout bouton ──
     # On récupère les modifications du data_editor depuis son état interne
