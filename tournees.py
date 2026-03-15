@@ -487,7 +487,7 @@ with st.sidebar:
 # ONGLETS
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("🚛 Optimiseur de Tournées — Assainissement")
+st.title("PROTOTYPE - Optimiseur de tournées")
 st.caption(f"🏭 Dépôt fixe : **{DEPOT_ADDRESS}**")
 
 tab_saisie, tab_optim, tab_export = st.tabs([
