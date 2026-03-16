@@ -848,13 +848,14 @@ def export_pdf(result, tour_date, driver_name):
     row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD"))]
 
     # Largeur utile A4 avec marges 8mm : 194mm
-    CW = [7*mm, 20*mm, 18*mm, 14*mm, 8*mm, 18*mm, 43*mm, 10*mm, 12*mm, 12*mm, 12*mm, 12*mm]
+    CW = [7*mm, 28*mm, 26*mm, 20*mm, 8*mm, 18*mm, 35*mm, 10*mm, 12*mm, 12*mm, 12*mm, 12*mm]
     stops_table = Table(table_data, colWidths=CW, repeatRows=1)
     base_style = [
         ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
         ("ALIGN",         (6, 1), (6, -1), "LEFT"),
-        ("ALIGN",         (1, 1), (1, -1), "LEFT"),
+        ("ALIGN",         (1, 1), (3, -1), "LEFT"),
+        ("NOSPLIT",        (1, 1), (3, -1)),
         ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ("ROWBACKGROUNDS",(0, 1), (-1, -2), [colors.white, colors.HexColor("#F9F9F9")]),
         ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
@@ -885,8 +886,40 @@ def export_pdf(result, tour_date, driver_name):
     except Exception as e:
         story.append(Paragraph(f"(Carte non disponible : {e})", styles["Normal"]))
 
+    # ── Consignes par action ──
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width="100%", thickness=1,
+                             color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
+    story.append(Paragraph("Consignes par type d'intervention", consigne_title_style))
+
+    action_header_colors = {
+        "Nettoyer":     "#1f6aa5",
+        "Déposer":      "#28a745",
+        "Retirer":      "#dc3545",
+        "Chargement":   "#7B1FA2",
+        "Déchargement": "#E65100",
+    }
+    seen = []
+    for stop in result["stops_ordered"]:
+        if stop["action"] not in seen:
+            seen.append(stop["action"])
+    for action, consigne_text in ACTION_CONSIGNES.items():
+        if action not in seen:
+            continue
+        hcol = colors.HexColor(action_header_colors.get(action, "#555555"))
+        consigne_data = [[Paragraph(f"■  {action}", action_label_style)]]
+        consigne_table = Table(consigne_data, colWidths=[194*mm])
+        consigne_table.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), hcol),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ]))
+        story.append(consigne_table)
+        story.append(Paragraph(consigne_text, consigne_text_style))
+
     # ── Checklist par action ──
-    story.append(Spacer(1, 4*mm))
+    story.append(Spacer(1, 6*mm))
     story.append(HRFlowable(width="100%", thickness=1,
                              color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
     story.append(Paragraph("Checklist par intervention", consigne_title_style))
@@ -898,22 +931,26 @@ def export_pdf(result, tour_date, driver_name):
             "Réapprovisionnement papier / gel / savon",
             "Vérification porte et serrure",
             "Vérification état général (sol, parois)",
+            "Photos / vidéos avant et après intervention",
             "Signalement des dégradations sur la fiche",
         ],
         "Déposer": [
             "Vérification propreté avant remise au client",
             "Positionnement sur zone désignée",
             "Vérification stabilité et aplomb",
+            "Photos de l'installation en place",
             "Remise des consignes d'utilisation (1ère installation)",
             "Bon de livraison signé par le client",
         ],
         "Retirer": [
             "Vidange de la cuve avant enlèvement",
             "Nettoyage de la zone après retrait",
+            "Photos / vidéos de l'état de l'équipement au retrait",
             "Contrôle état de l'équipement (noter dommages)",
             "Bon de retrait signé par le client",
         ],
         "Chargement": [
+            "Photos de l'équipement avant chargement (état existant)",
             "Contrôle état de l'équipement avant chargement",
             "Arrimage correct du chargement",
             "Vérification charge utile respectée",
@@ -921,12 +958,12 @@ def export_pdf(result, tour_date, driver_name):
         ],
         "Déchargement": [
             "Déchargement avec équipements adaptés",
+            "Photos de l'équipement après déchargement",
             "Contrôle état après déchargement",
             "Positionnement sur aire de stockage désignée",
             "Bon de livraison signé",
         ],
     }
-
     action_header_colors_cl = {
         "Nettoyer":     "#1f6aa5",
         "Déposer":      "#28a745",
@@ -934,18 +971,15 @@ def export_pdf(result, tour_date, driver_name):
         "Chargement":   "#7B1FA2",
         "Déchargement": "#E65100",
     }
-
     seen_cl = []
     for stop in result["stops_ordered"]:
         if stop["action"] not in seen_cl:
             seen_cl.append(stop["action"])
-
     for action in seen_cl:
         checks = ACTION_CHECKLIST.get(action, [])
         if not checks:
             continue
         hcol = colors.HexColor(action_header_colors_cl.get(action, "#555555"))
-        # Bandeau titre action
         cl_title_data = [[Paragraph(f"&#9632;  {action}", cell_white)]]
         cl_title_table = Table(cl_title_data, colWidths=[194*mm])
         cl_title_table.setStyle(TableStyle([
@@ -955,8 +989,6 @@ def export_pdf(result, tour_date, driver_name):
             ("LEFTPADDING",   (0, 0), (-1, -1), 8),
         ]))
         story.append(cl_title_table)
-
-        # Cases à cocher
         check_rows = [[
             Paragraph("☐", check_style),
             Paragraph(item, check_style)
@@ -983,7 +1015,6 @@ def export_pdf(result, tour_date, driver_name):
         ParagraphStyle("obs_sub", parent=styles["Normal"], fontSize=8,
                        textColor=colors.grey, spaceAfter=4)
     ))
-    # Zone de texte libre (lignes vides)
     obs_rows = [[""] for _ in range(8)]
     obs_table = Table(obs_rows, colWidths=[194*mm], rowHeights=[10*mm]*8)
     obs_table.setStyle(TableStyle([
@@ -994,41 +1025,6 @@ def export_pdf(result, tour_date, driver_name):
     ]))
     story.append(obs_table)
     story.append(Spacer(1, 4*mm))
-
-    # ── Consignes par action ──
-    story.append(Spacer(1, 6*mm))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
-    story.append(Paragraph("Consignes par type d'intervention", consigne_title_style))
-
-    action_header_colors = {
-        "Nettoyer":     "#1f6aa5",
-        "Déposer":      "#28a745",
-        "Retirer":      "#dc3545",
-        "Chargement":   "#7B1FA2",
-        "Déchargement": "#E65100",
-    }
-
-    # Trouver les actions présentes dans la tournée (dans l'ordre d'apparition)
-    seen = []
-    for stop in result["stops_ordered"]:
-        if stop["action"] not in seen:
-            seen.append(stop["action"])
-    # Toujours afficher toutes les consignes pertinentes dans cet ordre
-    for action, consigne_text in ACTION_CONSIGNES.items():
-        if action not in seen:
-            continue
-        hcol = colors.HexColor(action_header_colors.get(action, "#555555"))
-        consigne_data = [[Paragraph(f"■  {action}", action_label_style)]]
-        consigne_table = Table(consigne_data, colWidths=[194*mm])
-        consigne_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), hcol),
-            ("TOPPADDING",    (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 8),
-        ]))
-        story.append(consigne_table)
-        story.append(Paragraph(consigne_text, consigne_text_style))
 
     # ── Footer ──
     story.append(HRFlowable(width="100%", thickness=0.5,
