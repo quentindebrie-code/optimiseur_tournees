@@ -15,12 +15,18 @@ import datetime
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
+import matplotlib
+matplotlib.use('Agg')  # backend non-interactif
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+
 # reportlab – gestion UTF-8 native, aucun problème d'encodage
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
 from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
-                                 Paragraph, Spacer, HRFlowable)
+                                 Paragraph, Spacer, HRFlowable, Image as RLImage)
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 
@@ -33,17 +39,68 @@ DEPOT_COORDS  = (43.7746, 1.9028)  # GPS fixe – jamais géocodé
 OSRM_URL      = "http://router.project-osrm.org"
 
 ACTION_COLORS = {
-    "Nettoyer": "#AEC6E8",
-    "Déposer":  "#B7E5B4",
-    "Retirer":  "#F4B8C1",
+    "Nettoyer":      "#AEC6E8",
+    "Déposer":       "#B7E5B4",
+    "Retirer":       "#F4B8C1",
+    "Chargement":    "#D4B8E0",
+    "Déchargement":  "#FFE0B2",
 }
 ACTION_BORDER_COLORS = {
-    "Nettoyer": "#1f6aa5",
-    "Déposer":  "#28a745",
-    "Retirer":  "#dc3545",
+    "Nettoyer":      "#1f6aa5",
+    "Déposer":       "#28a745",
+    "Retirer":       "#dc3545",
+    "Chargement":    "#7B1FA2",
+    "Déchargement":  "#E65100",
 }
-ACTION_MAP_COLORS = {"Nettoyer": "blue", "Déposer": "green", "Retirer": "red"}
-ACTION_MAP_ICONS  = {"Nettoyer": "tint", "Déposer": "arrow-down", "Retirer": "arrow-up"}
+ACTION_MAP_COLORS = {
+    "Nettoyer":     "blue",
+    "Déposer":      "green",
+    "Retirer":      "red",
+    "Chargement":   "purple",
+    "Déchargement": "orange",
+}
+ACTION_MAP_ICONS = {
+    "Nettoyer":     "tint",
+    "Déposer":      "arrow-down",
+    "Retirer":      "arrow-up",
+    "Chargement":   "upload",
+    "Déchargement": "download",
+}
+
+
+# Consignes par type d'action (affichées dans le PDF)
+ACTION_CONSIGNES = {
+    "Nettoyer": (
+        "Vidanger complètement la cuve. Nettoyer l'intérieur avec les produits homologués. "
+        "Vérifier et réapprovisionner les consommables (papier, gel désinfectant, savon). "
+        "Inspecter l'état général (porte, serrure, sol). Signaler tout dysfonctionnement "
+        "ou dégradation sur la fiche de tournée."
+    ),
+    "Déposer": (
+        "Positionner l'équipement sur la zone désignée par le client, hors obstacle et "
+        "zone de passage. Vérifier la stabilité et l'aplomb. Vérifier la propreté avant "
+        "remise au client. Informer le client de la mise en service et lui remettre les "
+        "consignes d'utilisation si première installation."
+    ),
+    "Retirer": (
+        "Vidanger la cuve avant enlèvement, même si partiellement remplie. "
+        "Vérifier que la zone est propre et sans trace après retrait. "
+        "Noter l'état de l'équipement au chargement (dégradation, pièce manquante). "
+        "Obtenir la signature du bon de retrait si présence du client."
+    ),
+    "Chargement": (
+        "Vérifier l'état de l'équipement avant chargement (noter les dommages existants). "
+        "Arrimer correctement le chargement selon le plan de chargement. "
+        "S'assurer que le poids total ne dépasse pas la charge utile du véhicule avec remorque. "
+        "Vérifier les feux de la remorque avant départ."
+    ),
+    "Déchargement": (
+        "Décharger avec précaution en utilisant les équipements de manutention adaptés. "
+        "Vérifier l'état de l'équipement après déchargement. "
+        "Positionner sur l'aire de stockage désignée. "
+        "Renseigner le bon de livraison et faire signer le destinataire."
+    ),
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG PAGE
@@ -67,8 +124,8 @@ st.markdown("""
 
 def _init_df():
     return pd.DataFrame({
-        "Action":        ["Nettoyer", "Nettoyer", "Nettoyer"],
-        "Quantité":      ["1 WC",     "1 WC",     "1 WC"],
+        "Action":        ["Nettoyer",  "Nettoyer",  "Nettoyer"],
+        "Quantité":      ["1 WC",      "1 WC",      "1 WC"],
         "Nom du client": ["",         "",         ""],
         "Adresse":       ["",         "",         ""],
         "Durée (min)":   [30,         30,         30],
@@ -391,6 +448,101 @@ def build_map(depot_coords, stops_ordered, geometry):
                           icon_size=(20, 20), icon_anchor=(0, 0))).add_to(m)
     return m
 
+
+def generate_map_image(depot_coords, stops_ordered, geometry):
+    """
+    Génère une image PNG de la carte de tournée via matplotlib.
+    Retourne des bytes PNG.
+    """
+    fig, ax = plt.subplots(figsize=(14, 10), dpi=120)
+    ax.set_facecolor("#F0EFE7")
+    fig.patch.set_facecolor("#FFFFFF")
+
+    # Couleurs actions
+    mpl_colors = {
+        "Nettoyer":     "#1f6aa5",
+        "Déposer":      "#28a745",
+        "Retirer":      "#dc3545",
+        "Chargement":   "#7B1FA2",
+        "Déchargement": "#E65100",
+    }
+
+    if geometry:
+        lons = [pt[1] for pt in geometry]
+        lats = [pt[0] for pt in geometry]
+        ax.plot(lons, lats, color="#1f4e79", linewidth=2.5, zorder=2, solid_capstyle="round")
+
+    # Dépôt
+    dlat, dlon = depot_coords
+    ax.scatter(dlon, dlat, s=220, c="#FFC107", edgecolors="#333", linewidths=1.5,
+               zorder=5, marker="*", label="Dépôt")
+    ax.annotate("Dépôt", (dlon, dlat), textcoords="offset points", xytext=(6, 6),
+                fontsize=8, fontweight="bold", color="#333",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7, ec="none"))
+
+    # Arrêts
+    for stop in stops_ordered:
+        if stop["lat"] is None:
+            continue
+        c = mpl_colors.get(stop["action"], "#555")
+        ax.scatter(stop["lon"], stop["lat"], s=120, c=c, edgecolors="white",
+                   linewidths=1.2, zorder=4)
+        ax.annotate(
+            str(stop["order_num"]),
+            (stop["lon"], stop["lat"]),
+            ha="center", va="center", fontsize=7, fontweight="bold",
+            color="white", zorder=5
+        )
+        label = stop["address"][:28] + ("…" if len(stop["address"]) > 28 else "")
+        ax.annotate(label, (stop["lon"], stop["lat"]),
+                    textcoords="offset points", xytext=(8, 4),
+                    fontsize=6.5, color="#222",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.75, ec="none"))
+
+    # Légende
+    legend_elements = [
+        Line2D([0], [0], marker="*", color="w", markerfacecolor="#FFC107",
+               markeredgecolor="#333", markersize=12, label="Dépôt"),
+    ]
+    seen_actions = []
+    for stop in stops_ordered:
+        a = stop["action"]
+        if a not in seen_actions:
+            seen_actions.append(a)
+            legend_elements.append(
+                Line2D([0], [0], marker="o", color="w",
+                       markerfacecolor=mpl_colors.get(a, "#555"),
+                       markersize=9, label=a)
+            )
+    ax.legend(handles=legend_elements, loc="lower left", fontsize=8,
+              framealpha=0.9, edgecolor="#ccc")
+
+    ax.set_xlabel("Longitude", fontsize=8, color="#666")
+    ax.set_ylabel("Latitude",  fontsize=8, color="#666")
+    ax.tick_params(labelsize=7, colors="#666")
+    ax.grid(True, linestyle="--", alpha=0.4, color="#bbb")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#ccc")
+
+    # Marges auto avec padding
+    all_lons = [dlon] + [s["lon"] for s in stops_ordered if s["lon"]]
+    all_lats = [dlat] + [s["lat"] for s in stops_ordered if s["lat"]]
+    if len(all_lons) > 1:
+        pad_lon = (max(all_lons) - min(all_lons)) * 0.12 or 0.05
+        pad_lat = (max(all_lats) - min(all_lats)) * 0.12 or 0.05
+        ax.set_xlim(min(all_lons) - pad_lon, max(all_lons) + pad_lon)
+        ax.set_ylim(min(all_lats) - pad_lat, max(all_lats) + pad_lat)
+
+    ax.set_title("Carte de la tournée optimisée", fontsize=11,
+                 fontweight="bold", color="#1f4e79", pad=10)
+
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EXPORT EXCEL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -408,9 +560,11 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
     thin     = Side(style="thin", color="CCCCCC")
     brd      = Border(left=thin, right=thin, top=thin, bottom=thin)
     action_fills = {
-        "Nettoyer": PatternFill("solid", fgColor="AEC6E8"),
-        "Déposer":  PatternFill("solid", fgColor="B7E5B4"),
-        "Retirer":  PatternFill("solid", fgColor="F4B8C1"),
+        "Nettoyer":     PatternFill("solid", fgColor="AEC6E8"),
+        "Déposer":      PatternFill("solid", fgColor="B7E5B4"),
+        "Retirer":      PatternFill("solid", fgColor="F4B8C1"),
+        "Chargement":   PatternFill("solid", fgColor="D4B8E0"),
+        "Déchargement": PatternFill("solid", fgColor="FFE0B2"),
     }
 
     ws.merge_cells("A1:G1")
@@ -535,9 +689,11 @@ def export_pdf(result, tour_date, driver_name):
 
     # Tableau des arrêts
     action_bg = {
-        "Nettoyer": colors.HexColor("#AEC6E8"),
-        "Déposer":  colors.HexColor("#B7E5B4"),
-        "Retirer":  colors.HexColor("#F4B8C1"),
+        "Nettoyer":     colors.HexColor("#AEC6E8"),
+        "Déposer":      colors.HexColor("#B7E5B4"),
+        "Retirer":      colors.HexColor("#F4B8C1"),
+        "Chargement":   colors.HexColor("#D4B8E0"),
+        "Déchargement": colors.HexColor("#FFE0B2"),
     }
 
     table_data = [["N°", "Action", "Qté", "Client", "Adresse", "Durée", "Pas avant", "Pas après", "Arrivée", "Départ"]]
@@ -593,7 +749,69 @@ def export_pdf(result, tour_date, driver_name):
     story.append(stops_table)
     story.append(Spacer(1, 8*mm))
 
-    # Footer
+    # ── Carte de la tournée ──
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width="100%", thickness=1,
+                             color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
+    map_title_style = ParagraphStyle("map_title", parent=styles["Heading2"],
+                                      fontSize=12, textColor=colors.HexColor("#1F4E79"),
+                                      spaceAfter=4)
+    story.append(Paragraph("Carte de la tournée", map_title_style))
+    try:
+        map_bytes = generate_map_image(
+            result["depot_coords"], result["stops_ordered"], result["geometry"]
+        )
+        img_buf = BytesIO(map_bytes)
+        rl_img  = RLImage(img_buf, width=175*mm, height=120*mm)
+        story.append(rl_img)
+    except Exception as e:
+        story.append(Paragraph(f"(Carte non disponible : {e})", styles["Normal"]))
+
+    # ── Consignes par action ──
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width="100%", thickness=1,
+                             color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
+    consigne_title_style = ParagraphStyle("consigne_title", parent=styles["Heading2"],
+                                           fontSize=12, textColor=colors.HexColor("#1F4E79"),
+                                           spaceAfter=4)
+    story.append(Paragraph("Consignes par type d'intervention", consigne_title_style))
+
+    action_label_style = ParagraphStyle("action_label", parent=styles["Normal"],
+                                         fontSize=10, fontName="Helvetica-Bold",
+                                         textColor=colors.white, spaceAfter=2)
+    consigne_text_style = ParagraphStyle("consigne_text", parent=styles["Normal"],
+                                          fontSize=9, leftIndent=4, spaceAfter=8)
+
+    action_header_colors = {
+        "Nettoyer":     "#1f6aa5",
+        "Déposer":      "#28a745",
+        "Retirer":      "#dc3545",
+        "Chargement":   "#7B1FA2",
+        "Déchargement": "#E65100",
+    }
+
+    # Trouver les actions présentes dans la tournée (dans l'ordre d'apparition)
+    seen = []
+    for stop in result["stops_ordered"]:
+        if stop["action"] not in seen:
+            seen.append(stop["action"])
+    # Toujours afficher toutes les consignes pertinentes dans cet ordre
+    for action, consigne_text in ACTION_CONSIGNES.items():
+        if action not in seen:
+            continue
+        hcol = colors.HexColor(action_header_colors.get(action, "#555555"))
+        consigne_data = [[Paragraph(f"■  {action}", action_label_style)]]
+        consigne_table = Table(consigne_data, colWidths=[175*mm])
+        consigne_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), hcol),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ]))
+        story.append(consigne_table)
+        story.append(Paragraph(consigne_text, consigne_text_style))
+
+    # ── Footer ──
     story.append(HRFlowable(width="100%", thickness=0.5,
                              color=colors.grey, spaceBefore=4))
     story.append(Paragraph(
@@ -682,9 +900,9 @@ tab_saisie, tab_optim, tab_export = st.tabs([
 with tab_saisie:
     st.subheader("Saisie des arrêts de la tournée")
     st.info(
-        f"NOTICE D'UTILISATION DE L'OPTIMISEUR DE TOURNÉES : "
-        f"Tout départ et retour est à l'adresse suivante : (**{DEPOT_ADDRESS}**). "
-        f"L'ordre de saisie des zones d'intervention n'a pas d'importance. L'outil se charge de l'optimisation automatique.")
+        f"💡 Saisissez vos arrêts ci-dessous. "
+        f"Départ et retour au dépôt (**{DEPOT_ADDRESS}**) sont automatiques. "
+        f"L'ordre de saisie n'a pas d'importance.")
 
     # ── Fusion des éditions en cours dans df_stops avant tout bouton ──
     # On récupère les modifications du data_editor depuis son état interne
@@ -754,10 +972,17 @@ with tab_saisie:
         column_config={
             "Action": st.column_config.SelectboxColumn(
                 "Action", required=True, width="small",
-                options=["Nettoyer", "Déposer", "Retirer"]),
+                options=["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]),
             "Quantité": st.column_config.SelectboxColumn(
                 "Quantité", required=True, width="small",
-                options=["1 WC", "2 WC", "1 Lave Main", "2 Lave Main", "1 WC + 1 LM"]),
+                options=[
+                    "1 WC", "2 WC", "3 WC", "4 WC",
+                    "1 WC handicapé", "2 WC handicapé",
+                    "1 Lave Main", "2 Lave Main",
+                    "1 Urinoir", "2 Urinoirs",
+                    "1 WC + 1 Lave Main", "1 WC + 1 Urinoir",
+                    "2 WC + 1 Lave Main", "2 WC + 1 Urinoir",
+                ]),
             "Nom du client": st.column_config.TextColumn(
                 "Nom du client", width="medium"),
             "Adresse": st.column_config.TextColumn(
@@ -802,6 +1027,24 @@ with tab_saisie:
     valid_rows = live_df[live_df["Adresse"].fillna("").str.strip() != ""]
     n_valid    = len(valid_rows)
     st.caption(f"📍 **{n_valid}** arrêt(s) avec adresse renseignée")
+
+    # Avertissement WC sans urinoir ni lave-main
+    wc_keywords  = ["wc", "w.c", "toilette"]
+    lm_keywords  = ["lave main", "lave-main", "urinoir"]
+    wc_rows = valid_rows[
+        valid_rows["Quantité"].str.lower().str.contains("|".join(wc_keywords), na=False)
+        & ~valid_rows["Quantité"].str.lower().str.contains("|".join(lm_keywords), na=False)
+        & ~valid_rows["Quantité"].str.lower().str.contains("handicap", na=False)
+    ]
+    if len(wc_rows) > 0:
+        st.warning(
+            f"🚽 **{len(wc_rows)} arrêt(s) avec WC seul(s) détecté(s).** "
+            "La réglementation impose l'installation d'un **urinoir** ou d'un "
+            "**lave-main** à proximité de tout WC chimique dans les espaces de travail "
+            "(Code du travail, art. R4228-7). Pensez à vérifier si cette obligation s'applique "
+            "et à ajouter la quantité correspondante (ex : *1 WC + 1 Urinoir*)."
+        )
+
     st.markdown("---")
 
     if st.button("🚀 Optimiser la tournée", type="primary",
