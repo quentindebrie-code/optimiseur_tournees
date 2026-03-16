@@ -21,9 +21,6 @@ from reportlab.lib import colors
 from reportlab.lib.units import mm
 from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
                                  Paragraph, Spacer, HRFlowable, Image as RLImage)
-from reportlab.graphics.shapes import Drawing, PolyLine, Circle, String, Rect, Line as RLLine
-from reportlab.graphics import renderPDF
-from reportlab.graphics.renderbase import renderScaledDrawing
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 
@@ -448,122 +445,116 @@ def build_map(depot_coords, stops_ordered, geometry):
 
 def generate_map_image(depot_coords, stops_ordered, geometry):
     """
-    Génère une image PNG de la carte via reportlab (aucune dépendance externe).
-    Projection lat/lon → pixels avec normalisation sur la bbox.
-    Retourne des bytes PNG.
+    Génère une image PNG de la carte via Pillow (PIL).
+    Disponible partout, aucune dépendance système supplémentaire.
     """
-    from reportlab.graphics.shapes import (Drawing, PolyLine, Circle, String,
-                                            Rect, Line as RLLine, Group)
-    from reportlab.lib import colors as rlc
-    from reportlab.graphics import renderPM
+    from PIL import Image, ImageDraw
 
-    W, H      = 700, 480     # dimensions canvas en points
-    MARGIN    = 50
+    W, H   = 900, 600
+    MARGIN = 60
+    BG     = (240, 239, 231)   # fond beige carte
+    GRID   = (200, 200, 200)
+    ROUTE  = (31, 78, 121)
 
-    # Collecte de tous les points pour normalisation
+    ACTION_RGB = {
+        "Nettoyer":     (31,  106, 165),
+        "Déposer":      (40,  167,  69),
+        "Retirer":      (220,  53,  69),
+        "Chargement":   (123,  31, 162),
+        "Déchargement": (230,  81,   0),
+    }
+
+    img  = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Points pour normalisation
     all_lats = [depot_coords[0]] + [s["lat"] for s in stops_ordered if s["lat"]]
     all_lons = [depot_coords[1]] + [s["lon"] for s in stops_ordered if s["lon"]]
-
     min_lat, max_lat = min(all_lats), max(all_lats)
     min_lon, max_lon = min(all_lons), max(all_lons)
     span_lat = max_lat - min_lat or 0.01
     span_lon = max_lon - min_lon or 0.01
-
-    # Padding 12%
-    pad_lat = span_lat * 0.12
-    pad_lon = span_lon * 0.12
+    pad_lat, pad_lon = span_lat * 0.14, span_lon * 0.14
     min_lat -= pad_lat; max_lat += pad_lat
     min_lon -= pad_lon; max_lon += pad_lon
     span_lat = max_lat - min_lat
     span_lon = max_lon - min_lon
 
     def proj(lat, lon):
-        """Lat/lon → coordonnées canvas (origine bas-gauche reportlab)."""
-        x = MARGIN + (lon - min_lon) / span_lon * (W - 2 * MARGIN)
-        y = MARGIN + (lat - min_lat) / span_lat * (H - 2 * MARGIN)
-        return x, y
+        x = int(MARGIN + (lon - min_lon) / span_lon * (W - 2 * MARGIN))
+        y = int(H - MARGIN - (lat - min_lat) / span_lat * (H - 2 * MARGIN))
+        return (x, y)
 
-    d = Drawing(W, H)
-
-    # Fond
-    d.add(Rect(0, 0, W, H, fillColor=rlc.HexColor("#F0EFE7"), strokeColor=None))
-
-    # Grille légère
+    # Grille
     for i in range(6):
-        xi = MARGIN + i * (W - 2*MARGIN) / 5
-        yi = MARGIN + i * (H - 2*MARGIN) / 5
-        d.add(RLLine(xi, MARGIN, xi, H-MARGIN,
-                     strokeColor=rlc.HexColor("#CCCCCC"), strokeWidth=0.5))
-        d.add(RLLine(MARGIN, yi, W-MARGIN, yi,
-                     strokeColor=rlc.HexColor("#CCCCCC"), strokeWidth=0.5))
+        xi = MARGIN + int(i * (W - 2*MARGIN) / 5)
+        yi = MARGIN + int(i * (H - 2*MARGIN) / 5)
+        draw.line([(xi, MARGIN), (xi, H-MARGIN)], fill=GRID, width=1)
+        draw.line([(MARGIN, yi), (W-MARGIN, yi)], fill=GRID, width=1)
 
-    # Tracé de la route
+    # Bordure
+    draw.rectangle([MARGIN-1, MARGIN-1, W-MARGIN+1, H-MARGIN+1],
+                   outline=(150, 150, 150), width=1)
+
+    # Tracé route
     if geometry and len(geometry) > 1:
-        pts = []
-        for lat, lon in geometry:
-            x, y = proj(lat, lon)
-            pts += [x, y]
-        d.add(PolyLine(pts, strokeColor=rlc.HexColor("#1f4e79"),
-                       strokeWidth=2.5, fillColor=None))
-
-    # Couleurs actions
-    mpl_colors = {
-        "Nettoyer":     "#1f6aa5",
-        "Déposer":      "#28a745",
-        "Retirer":      "#dc3545",
-        "Chargement":   "#7B1FA2",
-        "Déchargement": "#E65100",
-    }
+        pts = [proj(lat, lon) for lat, lon in geometry]
+        for i in range(len(pts) - 1):
+            # Ombre épaisse
+            draw.line([pts[i], pts[i+1]], fill=(180, 200, 220), width=6)
+        for i in range(len(pts) - 1):
+            draw.line([pts[i], pts[i+1]], fill=ROUTE, width=3)
 
     # Dépôt
     dx, dy = proj(depot_coords[0], depot_coords[1])
-    d.add(Circle(dx, dy, 10, fillColor=rlc.HexColor("#FFC107"),
-                 strokeColor=rlc.HexColor("#333333"), strokeWidth=1.5))
-    d.add(String(dx, dy - 4, "D", fontSize=9, fontName="Helvetica-Bold",
-                 fillColor=rlc.HexColor("#333333"), textAnchor="middle"))
-    d.add(String(dx + 13, dy + 4, "Dépôt", fontSize=7, fontName="Helvetica",
-                 fillColor=rlc.HexColor("#333333")))
+    r = 12
+    draw.ellipse([dx-r, dy-r, dx+r, dy+r], fill=(255, 193, 7), outline=(51, 51, 51), width=2)
+    draw.text((dx, dy), "D", fill=(51, 51, 51), anchor="mm")
+    draw.text((dx + r + 4, dy - 5), "Dépôt", fill=(51, 51, 51))
 
     # Arrêts
     for stop in stops_ordered:
         if stop["lat"] is None:
             continue
-        sx, sy = proj(stop["lat"], stop["lon"])
-        c = rlc.HexColor(mpl_colors.get(stop["action"], "#555555"))
-        d.add(Circle(sx, sy, 9, fillColor=c,
-                     strokeColor=rlc.white, strokeWidth=1.2))
-        d.add(String(sx, sy - 3.5, str(stop["order_num"]),
-                     fontSize=7.5, fontName="Helvetica-Bold",
-                     fillColor=rlc.white, textAnchor="middle"))
-        label = stop["address"][:30] + ("…" if len(stop["address"]) > 30 else "")
-        d.add(String(sx + 12, sy - 3, label,
-                     fontSize=6, fontName="Helvetica",
-                     fillColor=rlc.HexColor("#222222")))
+        sx, sy  = proj(stop["lat"], stop["lon"])
+        rgb     = ACTION_RGB.get(stop["action"], (85, 85, 85))
+        r_stop  = 11
+        # Ombre
+        draw.ellipse([sx-r_stop+1, sy-r_stop+1, sx+r_stop+1, sy+r_stop+1],
+                     fill=(180, 180, 180))
+        draw.ellipse([sx-r_stop, sy-r_stop, sx+r_stop, sy+r_stop],
+                     fill=rgb, outline=(255, 255, 255), width=2)
+        draw.text((sx, sy), str(stop["order_num"]), fill=(255, 255, 255), anchor="mm")
+        # Étiquette
+        label = stop["address"][:32] + ("…" if len(stop["address"]) > 32 else "")
+        lx, ly = sx + r_stop + 4, sy - 7
+        # Fond blanc semi-transparent
+        bbox = draw.textbbox((lx, ly), label)
+        draw.rectangle([bbox[0]-2, bbox[1]-1, bbox[2]+2, bbox[3]+1],
+                       fill=(255, 255, 255, 200))
+        draw.text((lx, ly), label, fill=(30, 30, 30))
 
-    # Légende
-    lx, ly = MARGIN, H - MARGIN + 12
-    d.add(String(lx, ly, "Dépôt", fontSize=7, fontName="Helvetica-Bold",
-                 fillColor=rlc.HexColor("#333333")))
-    lx += 45
+    # Légende en bas
+    lx, ly = MARGIN, H - MARGIN + 14
+    draw.text((lx, ly), "●  Dépôt", fill=(51, 51, 51))
+    lx += 80
     seen = []
     for stop in stops_ordered:
         a = stop["action"]
         if a not in seen:
             seen.append(a)
-            c = rlc.HexColor(mpl_colors.get(a, "#555555"))
-            d.add(Circle(lx + 5, ly + 3, 5, fillColor=c, strokeColor=rlc.white))
-            d.add(String(lx + 13, ly, a, fontSize=7, fontName="Helvetica",
-                         fillColor=rlc.HexColor("#333333")))
-            lx += len(a) * 5.5 + 20
+            rgb = ACTION_RGB.get(a, (85, 85, 85))
+            draw.ellipse([lx, ly+2, lx+10, ly+12], fill=rgb)
+            draw.text((lx+14, ly), a, fill=(51, 51, 51))
+            lx += len(a) * 7 + 24
 
     # Titre
-    d.add(String(W/2, H - 20, "Carte de la tournée optimisée",
-                 fontSize=11, fontName="Helvetica-Bold",
-                 fillColor=rlc.HexColor("#1F4E79"), textAnchor="middle"))
+    title = "Tournée optimisée"
+    tw = draw.textlength(title)
+    draw.text(((W - tw) // 2, 14), title, fill=(31, 78, 121))
 
-    # Export PNG via reportlab renderPM
     buf = BytesIO()
-    renderPM.drawToFile(d, buf, fmt="PNG", dpi=120)
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.read()
 
