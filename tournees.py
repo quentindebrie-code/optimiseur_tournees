@@ -118,13 +118,15 @@ st.markdown("""
 
 def _init_df():
     return pd.DataFrame({
-        "Action":        ["Nettoyer",  "Nettoyer",  "Nettoyer"],
-        "Quantité":      ["1 WC",      "1 WC",      "1 WC"],
-        "Nom du client": ["",         "",         ""],
-        "Adresse":       ["",         "",         ""],
-        "Durée (min)":   [30,         30,         30],
-        "Pas avant":     ["",         "",         ""],
-        "Pas après":     ["",         "",         ""],
+        "Action":        ["Nettoyer",    "Nettoyer",    "Nettoyer"],
+        "Produit":       ["WC chimique", "WC chimique", "WC chimique"],
+        "Option":        ["Lave-main",   "Lave-main",   "Lave-main"],
+        "Quantité":      [1,             1,             1],
+        "Nom du client": ["",            "",            ""],
+        "Adresse":       ["",            "",            ""],
+        "Durée (min)":   [30,            30,            30],
+        "Pas avant":     ["",            "",            ""],
+        "Pas après":     ["",            "",            ""],
     })
 
 if "df_stops"        not in st.session_state: st.session_state.df_stops        = _init_df()
@@ -230,6 +232,30 @@ def _compute_optimal_departure(tour, matrix, time_windows):
     optimal = min(candidates)
     # Arrondir à la minute inférieure
     return max(0, int(optimal))
+
+
+def _qty_label(row):
+    """
+    Construit la description lisible de la commande à partir des colonnes
+    Produit / Option / Quantité.
+    Ex : "3 × WC chimique + 3 × Urinoir"
+         "2 × Lave-main"
+    """
+    produit = str(row.get("Produit", "") or "").strip()
+    option  = str(row.get("Option",  "") or "").strip()
+    try:
+        qty = int(row.get("Quantité", 1) or 1)
+    except (ValueError, TypeError):
+        qty = 1
+
+    if not produit:
+        return f"{qty} × ?"
+
+    label = f"{qty} × {produit}"
+    # Option uniquement pour WC chimique et si renseignée
+    if produit == "WC chimique" and option:
+        label += f" + {qty} × {option}"
+    return label
 
 def _compute_arrivals(tour, matrix, depart_min, time_windows):
     """
@@ -606,7 +632,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         ws.cell(r, 2).alignment = left
     ws.append([])
 
-    headers = ["Ordre", "Action", "Quantité", "Nom du client", "Adresse", "Durée (min)", "Pas avant", "Pas après", "Arrivée", "Départ", "✓ Fait"]
+    headers = ["Ordre", "Action", "Produit", "Option", "Qté", "Nom du client", "Adresse", "Durée (min)", "Pas avant", "Pas après", "Arrivée", "Départ", "✓ Fait"]
     ws.append(headers)
     hr = ws.max_row
     for col, h in enumerate(headers, 1):
@@ -616,7 +642,9 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
     ws.row_dimensions[hr].height = 20
 
     for stop in result["stops_ordered"]:
-        ws.append([stop["order_num"], stop["action"], stop["quantity"],
+        ws.append([stop["order_num"], stop["action"],
+                   stop.get("produit", ""), stop.get("option", ""),
+                   stop.get("qty_num", ""),
                    stop["client"] or "", stop["address"],
                    stop.get("duration_min", ""),
                    _fmt_min(stop.get("tw_early")),
@@ -625,25 +653,25 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
                    _fmt_min(stop.get("departure_min")),
                    ""])
         r = ws.max_row
-        for col in range(1, 12):
+        for col in range(1, 14):
             c = ws.cell(r, col)
             c.border = brd
-            c.alignment = center if col != 5 else left
-            if col == 9 and stop.get("violated"):
+            c.alignment = center if col != 7 else left
+            if col == 11 and stop.get("violated"):
                 c.font = Font(bold=True, color="DC3545")
         ws.cell(r, 2).fill = action_fills.get(stop["action"],
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
 
-    ws.append(["↩", "Retour dépôt", "", "", DEPOT_ADDRESS, "", "", "", "", "", ""])
+    ws.append(["↩", "Retour dépôt", "", "", "", "", DEPOT_ADDRESS, "", "", "", "", "", ""])
     r = ws.max_row
-    for col in range(1, 12):
+    for col in range(1, 14):
         c = ws.cell(r, col)
         c.fill = PatternFill("solid", fgColor="FFF3CD")
         c.font = bold_f; c.border = brd
-        c.alignment = center if col != 5 else left
+        c.alignment = center if col != 7 else left
 
-    for col, width in zip(range(1, 12), [8, 14, 14, 22, 44, 12, 12, 12, 12, 12, 8]):
+    for col, width in zip(range(1, 14), [8, 14, 16, 14, 6, 22, 44, 12, 12, 12, 12, 12, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
     buf = BytesIO()
@@ -712,37 +740,44 @@ def export_pdf(result, tour_date, driver_name):
         "Déchargement": colors.HexColor("#FFE0B2"),
     }
 
-    table_data = [["N°", "Action", "Qté", "Client", "Adresse", "Durée", "Pas avant", "Pas après", "Arrivée", "Départ"]]
+    table_data = [["N°", "Action", "Produit", "Option", "Qté", "Client", "Adresse", "Durée", "Pav.", "Pap.", "Arr.", "Dép."]]
     row_styles = []
 
     # Ligne dépôt départ
-    table_data.append(["", "Dépôt – Départ", "", "", DEPOT_ADDRESS, "", "", "", _fmt_min(result.get("depart_min")) or "", ""])
+    table_data.append(["", "Dépôt – Départ", "", "", "", "", DEPOT_ADDRESS, "", "", "", _fmt_min(result.get("depart_min")) or "", ""])
     row_styles += [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#FFF3CD")),
                    ("FONTNAME",   (0, 1), (-1, 1), "Helvetica-Bold")]
 
     for i, stop in enumerate(result["stops_ordered"]):
         arr_str = _fmt_min(stop.get("arrival_min")) or ""
-        table_data.append([str(stop["order_num"]), stop["action"],
-                           stop["quantity"], stop["client"] or "", stop["address"],
-                           str(stop.get("duration_min", "") or ""),
-                           _fmt_min(stop.get("tw_early")) or "",
-                           _fmt_min(stop.get("tw_late")) or "",
-                           arr_str,
-                           _fmt_min(stop.get("departure_min")) or ""])
+        table_data.append([
+            str(stop["order_num"]),
+            stop["action"],
+            stop.get("produit", ""),
+            stop.get("option", ""),
+            str(stop.get("qty_num", "")),
+            stop["client"] or "",
+            stop["address"],
+            str(stop.get("duration_min", "") or ""),
+            _fmt_min(stop.get("tw_early")) or "",
+            _fmt_min(stop.get("tw_late")) or "",
+            arr_str,
+            _fmt_min(stop.get("departure_min")) or "",
+        ])
         ri = i + 2
         bg = action_bg.get(stop["action"], colors.HexColor("#F0F0F0"))
         row_styles.append(("BACKGROUND", (1, ri), (1, ri), bg))
         if stop.get("violated"):
-            row_styles.append(("TEXTCOLOR", (8, ri), (8, ri), colors.HexColor("#DC3545")))
-            row_styles.append(("FONTNAME",  (8, ri), (8, ri), "Helvetica-Bold"))
+            row_styles.append(("TEXTCOLOR", (10, ri), (10, ri), colors.HexColor("#DC3545")))
+            row_styles.append(("FONTNAME",  (10, ri), (10, ri), "Helvetica-Bold"))
 
     # Ligne dépôt retour
-    table_data.append(["", "Dépôt – Retour", "", "", DEPOT_ADDRESS, "", "", "", "", _fmt_min(result.get("return_min")) or ""])
+    table_data.append(["", "Dépôt – Retour", "", "", "", "", DEPOT_ADDRESS, "", "", "", "", _fmt_min(result.get("return_min")) or ""])
     last = len(table_data) - 1
     row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD")),
                    ("FONTNAME",   (0, last), (-1, last), "Helvetica-Bold")]
 
-    stops_table = Table(table_data, colWidths=[7*mm, 22*mm, 14*mm, 22*mm, 52*mm, 13*mm, 14*mm, 14*mm, 14*mm, 14*mm],
+    stops_table = Table(table_data, colWidths=[7*mm, 20*mm, 18*mm, 14*mm, 8*mm, 18*mm, 40*mm, 10*mm, 12*mm, 12*mm, 12*mm, 12*mm],
                         repeatRows=1)
     base_style = [
         ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
@@ -753,7 +788,7 @@ def export_pdf(result, tour_date, driver_name):
         ("FONTNAME",    (0, 1), (-1, -1), "Helvetica"),
         ("FONTSIZE",    (0, 1), (-1, -1), 9),
         ("ALIGN",       (0, 1), (-1, -1), "CENTER"),
-        ("ALIGN",       (4, 1), (4, -1), "LEFT"),
+        ("ALIGN",       (6, 1), (6, -1), "LEFT"),
         ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -2),
          [colors.white, colors.HexColor("#F9F9F9")]),
@@ -947,8 +982,12 @@ with tab_saisie:
     with c1:
         if st.button("➕ Ajouter un arrêt", use_container_width=True):
             _flush_editor()
-            new_row = pd.DataFrame({"Action": ["Nettoyer"], "Quantité": ["1 WC"],
-                                    "Nom du client": [""], "Adresse": [""]})
+            new_row = pd.DataFrame({
+                "Action": ["Nettoyer"], "Produit": ["WC chimique"],
+                "Option": ["Lave-main"], "Quantité": [1],
+                "Nom du client": [""], "Adresse": [""],
+                "Durée (min)": [30], "Pas avant": [""], "Pas après": [""],
+            })
             st.session_state.df_stops = pd.concat(
                 [st.session_state.df_stops, new_row], ignore_index=True)
             # Reset l'état interne du data_editor pour repartir proprement
@@ -989,16 +1028,17 @@ with tab_saisie:
             "Action": st.column_config.SelectboxColumn(
                 "Action", required=True, width="small",
                 options=["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]),
-            "Quantité": st.column_config.SelectboxColumn(
-                "Quantité", required=True, width="small",
-                options=[
-                    "1 WC", "2 WC", "3 WC", "4 WC",
-                    "1 WC handicapé", "2 WC handicapé",
-                    "1 Lave Main", "2 Lave Main",
-                    "1 Urinoir", "2 Urinoirs",
-                    "1 WC + 1 Lave Main", "1 WC + 1 Urinoir",
-                    "2 WC + 1 Lave Main", "2 WC + 1 Urinoir",
-                ]),
+            "Produit": st.column_config.SelectboxColumn(
+                "Produit", required=True, width="medium",
+                options=["WC chimique", "Lave-main", "Urinoir", "WC handicapé"]),
+            "Option": st.column_config.SelectboxColumn(
+                "Option (WC chim. uniquement)", width="medium",
+                options=["", "Lave-main", "Urinoir"],
+                help="Obligatoire pour WC chimique. Laissez vide pour les autres produits."),
+            "Quantité": st.column_config.NumberColumn(
+                "Qté", required=True, width="small",
+                min_value=1, max_value=20, step=1, default=1,
+                help="Nombre d'unités. Pour WC chimique : 1 option par WC."),
             "Nom du client": st.column_config.TextColumn(
                 "Nom du client", width="medium"),
             "Adresse": st.column_config.TextColumn(
@@ -1188,7 +1228,10 @@ with tab_saisie:
             stops_ordered.append({
                 "order_num":    rank,
                 "action":       row["Action"],
-                "quantity":     row["Quantité"],
+                "quantity":     _qty_label(row),
+                "produit":      row.get("Produit", ""),
+                "option":       row.get("Option",  ""),
+                "qty_num":      int(row.get("Quantité", 1) or 1),
                 "client":       row["Nom du client"],
                 "address":      row["Adresse"],
                 "lat":          coords[0] if coords else None,
