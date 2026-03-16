@@ -28,8 +28,12 @@ from reportlab.lib.enums import TA_CENTER
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPOT_DEPART_DEFAULT = "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe"
-DEPOT_RETOUR_DEFAULT = "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe"
+DEPOTS = {
+    "Saint-Sulpice":   "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe",
+    "Villemur-sur-Tarn": "11 Allée des Tailladettes, 31620 Labastide-Saint-Sernin",
+}
+DEPOT_DEPART_DEFAULT = "Saint-Sulpice"
+DEPOT_RETOUR_DEFAULT = "Saint-Sulpice"
 OSRM_URL      = "http://router.project-osrm.org"
 
 ACTION_COLORS = {
@@ -134,8 +138,8 @@ if "heure_min_depart"  not in st.session_state: st.session_state.heure_min_depar
 if "result"            not in st.session_state: st.session_state.result            = None
 if "tour_date"         not in st.session_state: st.session_state.tour_date         = datetime.date.today()
 if "driver"            not in st.session_state: st.session_state.driver            = ""
-if "depot_depart_addr" not in st.session_state: st.session_state.depot_depart_addr = DEPOT_DEPART_DEFAULT
-if "depot_retour_addr" not in st.session_state: st.session_state.depot_retour_addr = DEPOT_RETOUR_DEFAULT
+if "depot_depart_key" not in st.session_state: st.session_state.depot_depart_key = DEPOT_DEPART_DEFAULT
+if "depot_retour_key" not in st.session_state: st.session_state.depot_retour_key = DEPOT_RETOUR_DEFAULT
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCODAGE – API Adresse gouv.fr + fallback Nominatim
@@ -1085,18 +1089,23 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🏭 Dépôts")
-    st.session_state.depot_depart_addr = st.text_input(
+    depot_options = list(DEPOTS.keys())
+
+    st.session_state.depot_depart_key = st.selectbox(
         "📍 Dépôt de départ",
-        value=st.session_state.depot_depart_addr,
-        placeholder="ex : Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe",
-        help="Adresse complète du point de départ du chauffeur"
+        options=depot_options,
+        index=depot_options.index(st.session_state.depot_depart_key)
+              if st.session_state.depot_depart_key in depot_options else 0,
     )
-    st.session_state.depot_retour_addr = st.text_input(
+    st.caption(f"📌 {DEPOTS[st.session_state.depot_depart_key]}")
+
+    st.session_state.depot_retour_key = st.selectbox(
         "🏁 Dépôt de retour",
-        value=st.session_state.depot_retour_addr,
-        placeholder="ex : Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe",
-        help="Adresse complète du point de retour (peut différer du départ)"
+        options=depot_options,
+        index=depot_options.index(st.session_state.depot_retour_key)
+              if st.session_state.depot_retour_key in depot_options else 0,
     )
+    st.caption(f"📌 {DEPOTS[st.session_state.depot_retour_key]}")
 
     if st.session_state.result:
         st.divider()
@@ -1113,7 +1122,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.title("🚛 Optimiseur de Tournées — Assainissement")
-st.caption(f"🏭 Départ : **{st.session_state.depot_depart_addr}**  →  Retour : **{st.session_state.depot_retour_addr}**")
+st.caption(f"🏭 Départ : **{st.session_state.depot_depart_key}** · Retour : **{st.session_state.depot_retour_key}**")
 
 tab_saisie, tab_optim, tab_export = st.tabs([
     "📋  Saisie des arrêts",
@@ -1129,8 +1138,8 @@ with tab_saisie:
     st.subheader("Saisie des arrêts de la tournée")
     st.info(
         f"💡 Saisissez vos arrêts ci-dessous. "
-        f"Départ : **{st.session_state.depot_depart_addr}** · "
-        f"Retour : **{st.session_state.depot_retour_addr}**. "
+        f"Départ : **{st.session_state.depot_depart_key}** · "
+        f"Retour : **{st.session_state.depot_retour_key}**. "
         f"L'ordre de saisie n'a pas d'importance.")
 
     # ── Fusion des éditions en cours dans df_stops avant tout bouton ──
@@ -1297,8 +1306,8 @@ with tab_saisie:
 
         with st.spinner("🔍 Géocodage des adresses en cours…"):
             # Géocodage des dépôts
-            depot_depart_addr = st.session_state.depot_depart_addr.strip()
-            depot_retour_addr = st.session_state.depot_retour_addr.strip()
+            depot_depart_addr = DEPOTS[st.session_state.depot_depart_key]
+            depot_retour_addr = DEPOTS[st.session_state.depot_retour_key]
             if not depot_depart_addr:
                 st.error("❌ Veuillez renseigner le **Dépôt de départ** dans la barre latérale.")
                 st.stop()
