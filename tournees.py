@@ -28,8 +28,8 @@ from reportlab.lib.enums import TA_CENTER
 # CONSTANTES
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPOT_ADDRESS = "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe"
-DEPOT_COORDS  = (43.7746, 1.9028)  # GPS fixe – jamais géocodé
+DEPOT_DEPART_DEFAULT = "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe"
+DEPOT_RETOUR_DEFAULT = "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe"
 OSRM_URL      = "http://router.project-osrm.org"
 
 ACTION_COLORS = {
@@ -129,11 +129,13 @@ def _init_df():
         "Pas après":     ["",            "",            ""],
     })
 
-if "df_stops"        not in st.session_state: st.session_state.df_stops        = _init_df()
-if "heure_min_depart" not in st.session_state: st.session_state.heure_min_depart = datetime.time(7, 0)
-if "result"       not in st.session_state: st.session_state.result       = None
-if "tour_date"    not in st.session_state: st.session_state.tour_date    = datetime.date.today()
-if "driver"       not in st.session_state: st.session_state.driver       = ""
+if "df_stops"          not in st.session_state: st.session_state.df_stops          = _init_df()
+if "heure_min_depart"  not in st.session_state: st.session_state.heure_min_depart  = datetime.time(7, 0)
+if "result"            not in st.session_state: st.session_state.result            = None
+if "tour_date"         not in st.session_state: st.session_state.tour_date         = datetime.date.today()
+if "driver"            not in st.session_state: st.session_state.driver            = ""
+if "depot_depart_addr" not in st.session_state: st.session_state.depot_depart_addr = DEPOT_DEPART_DEFAULT
+if "depot_retour_addr" not in st.session_state: st.session_state.depot_retour_addr = DEPOT_RETOUR_DEFAULT
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCODAGE – API Adresse gouv.fr + fallback Nominatim
@@ -436,14 +438,21 @@ def osrm_route_distance(coords_latlon):
 # CARTE FOLIUM
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_map(depot_coords, stops_ordered, geometry):
+def build_map(depot_coords, stops_ordered, geometry, depot_depart_addr="Dépôt départ", depot_retour_addr=None, depot_retour_coords=None):
     m = folium.Map(location=depot_coords, zoom_start=11, tiles="CartoDB positron")
     if geometry:
         folium.PolyLine(geometry, color="#1f4e79", weight=4, opacity=0.85).add_to(m)
     folium.Marker(depot_coords,
-                  popup=folium.Popup(f"<b>Dépôt</b><br>{DEPOT_ADDRESS}", max_width=260),
-                  tooltip="Dépôt – Départ & Retour",
+                  popup=folium.Popup(f"<b>Dépôt départ</b><br>{r["depot_depart_addr"] if "r" in dir() else ""}", max_width=260),
+                  tooltip="Dépôt – Départ",
                   icon=folium.Icon(color="orange", icon="home", prefix="fa")).add_to(m)
+    # Marqueur retour dépôt si différent du départ
+    if depot_retour_coords and depot_retour_coords != depot_coords:
+        folium.Marker(depot_retour_coords,
+                      popup=folium.Popup(f"<b>Dépôt retour</b><br>{depot_retour_addr}", max_width=260),
+                      tooltip="Dépôt – Retour",
+                      icon=folium.Icon(color="darkred", icon="flag", prefix="fa")).add_to(m)
+
     for stop in stops_ordered:
         if stop["lat"] is None:
             continue
@@ -469,7 +478,7 @@ def build_map(depot_coords, stops_ordered, geometry):
     return m
 
 
-def generate_map_image(depot_coords, stops_ordered, geometry):
+def generate_map_image(depot_coords, stops_ordered, geometry, depot_retour_coords=None):
     """
     Génère une image PNG de la carte via Pillow (PIL).
     Disponible partout, aucune dépendance système supplémentaire.
@@ -536,7 +545,14 @@ def generate_map_image(depot_coords, stops_ordered, geometry):
     r = 12
     draw.ellipse([dx-r, dy-r, dx+r, dy+r], fill=(255, 193, 7), outline=(51, 51, 51), width=2)
     draw.text((dx, dy), "D", fill=(51, 51, 51), anchor="mm")
-    draw.text((dx + r + 4, dy - 5), "Dépôt", fill=(51, 51, 51))
+    draw.text((dx + r + 4, dy - 5), "Départ", fill=(51, 51, 51))
+
+    # Dépôt retour (si différent du départ)
+    if depot_retour_coords and depot_retour_coords != depot_coords:
+        rx2, ry2 = proj(depot_retour_coords[0], depot_retour_coords[1])
+        draw.ellipse([rx2-r, ry2-r, rx2+r, ry2+r], fill=(220, 53, 69), outline=(51, 51, 51), width=2)
+        draw.text((rx2, ry2), "R", fill=(255, 255, 255), anchor="mm")
+        draw.text((rx2 + r + 4, ry2 - 5), "Retour", fill=(51, 51, 51))
 
     # Arrêts
     for stop in stops_ordered:
@@ -618,7 +634,8 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
 
     for label, val in [
         ("Chauffeur",           driver_name or "—"),
-        ("Dépôt départ/retour", DEPOT_ADDRESS),
+        ("Dépôt de départ",  result.get("depot_depart_addr", "")),
+        ("Dépôt de retour",  result.get("depot_retour_addr", "")),
         ("Distance totale",     f"{result['distance_km']:.1f} km"),
         ("Durée estimée",       f"{int(result['duration_min']//60)}h{int(result['duration_min']%60):02d}"),
         ("Carburant estimé",    f"{result['fuel_liters']:.1f} L  ({result['fuel_cost']:.2f} €)"),
@@ -663,7 +680,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
 
-    ws.append(["↩", "Retour dépôt", "", "", "", "", DEPOT_ADDRESS, "", "", "", "", "", ""])
+    ws.append(["↩", "Retour dépôt", "", "", "", "", result.get("depot_retour_addr",""), "", "", "", "", "", ""])
     r = ws.max_row
     for col in range(1, 14):
         c = ws.cell(r, col)
@@ -686,8 +703,8 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
 def export_pdf(result, tour_date, driver_name):
     buf    = BytesIO()
     doc    = SimpleDocTemplate(buf, pagesize=A4,
-                               leftMargin=15*mm, rightMargin=15*mm,
-                               topMargin=15*mm, bottomMargin=15*mm)
+                               leftMargin=8*mm, rightMargin=8*mm,
+                               topMargin=10*mm, bottomMargin=10*mm)
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle("title", parent=styles["Heading1"],
@@ -696,6 +713,18 @@ def export_pdf(result, tour_date, driver_name):
     small_style = ParagraphStyle("small", parent=styles["Normal"],
                                  fontSize=8, textColor=colors.grey,
                                  alignment=TA_CENTER)
+    cell_style  = ParagraphStyle("cell", parent=styles["Normal"],
+                                 fontSize=8, leading=10, wordWrap="CJK")
+    cell_bold   = ParagraphStyle("cell_bold", parent=styles["Normal"],
+                                 fontSize=8, leading=10, fontName="Helvetica-Bold")
+    cell_white  = ParagraphStyle("cell_white", parent=styles["Normal"],
+                                 fontSize=8, leading=10, fontName="Helvetica-Bold",
+                                 textColor=colors.white)
+    check_style = ParagraphStyle("check", parent=styles["Normal"],
+                                 fontSize=9, leading=13, leftIndent=4)
+    obs_style   = ParagraphStyle("obs_title", parent=styles["Normal"],
+                                 fontSize=11, fontName="Helvetica-Bold",
+                                 textColor=colors.HexColor("#1F4E79"), spaceAfter=2)
 
     story = []
 
@@ -708,7 +737,8 @@ def export_pdf(result, tour_date, driver_name):
     # Récapitulatif
     recap_data = [
         ["Chauffeur :",             driver_name or "—"],
-        ["Dépôt départ / retour :", DEPOT_ADDRESS],
+        ["Dépôt de départ :", result.get("depot_depart_addr", "")],
+        ["Dépôt de retour :",  result.get("depot_retour_addr", "")],
         ["Distance totale :",       f"{result['distance_km']:.1f} km"],
         ["Durée de trajet :",
          f"{int(result['duration_min']//60)}h{int(result['duration_min']%60):02d}"],
@@ -740,65 +770,90 @@ def export_pdf(result, tour_date, driver_name):
         "Déchargement": colors.HexColor("#FFE0B2"),
     }
 
-    table_data = [["N°", "Action", "Produit", "Option", "Qté", "Client", "Adresse", "Durée", "Pav.", "Pap.", "Arr.", "Dép."]]
+    def P(txt, style=None):
+        """Wrapper Paragraph pour word-wrap dans les cellules."""
+        return Paragraph(str(txt) if txt is not None else "", style or cell_style)
+
+    # En-têtes avec Paragraph pour alignement uniforme
+    hdr_style = ParagraphStyle("hdr", parent=styles["Normal"],
+                                fontSize=8, fontName="Helvetica-Bold",
+                                textColor=colors.white, alignment=1)
+    table_data = [[P(h, hdr_style) for h in
+                   ["N°", "Action", "Produit", "Option", "Qté",
+                    "Client", "Adresse", "Durée", "Pav.", "Pap.", "Arr.", "Dép."]]]
     row_styles = []
 
+    depot_row_style = ParagraphStyle("dep_row", parent=styles["Normal"],
+                                      fontSize=8, fontName="Helvetica-Bold", leading=10)
+
     # Ligne dépôt départ
-    table_data.append(["", "Dépôt – Départ", "", "", "", "", DEPOT_ADDRESS, "", "", "", _fmt_min(result.get("depart_min")) or "", ""])
-    row_styles += [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#FFF3CD")),
-                   ("FONTNAME",   (0, 1), (-1, 1), "Helvetica-Bold")]
+    table_data.append([
+        P(""), P("🏭 Dépôt départ", depot_row_style), P(""), P(""), P(""),
+        P(""), P(result.get("depot_depart_addr",""), depot_row_style),
+        P(""), P(""), P(""),
+        P(_fmt_min(result.get("depart_min")) or "", depot_row_style), P("")
+    ])
+    row_styles += [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#FFF3CD"))]
 
     for i, stop in enumerate(result["stops_ordered"]):
         arr_str = _fmt_min(stop.get("arrival_min")) or ""
+        arr_para_style = cell_style
+        if stop.get("violated"):
+            arr_para_style = ParagraphStyle("viol", parent=styles["Normal"],
+                                             fontSize=8, leading=10,
+                                             textColor=colors.HexColor("#DC3545"),
+                                             fontName="Helvetica-Bold")
+        action_para_style = ParagraphStyle(f"act_{i}", parent=styles["Normal"],
+                                            fontSize=8, leading=10,
+                                            fontName="Helvetica-Bold",
+                                            textColor=colors.HexColor("#1F4E79"))
         table_data.append([
-            str(stop["order_num"]),
-            stop["action"],
-            stop.get("produit", ""),
-            stop.get("option", ""),
-            str(stop.get("qty_num", "")),
-            stop["client"] or "",
-            stop["address"],
-            str(stop.get("duration_min", "") or ""),
-            _fmt_min(stop.get("tw_early")) or "",
-            _fmt_min(stop.get("tw_late")) or "",
-            arr_str,
-            _fmt_min(stop.get("departure_min")) or "",
+            P(str(stop["order_num"])),
+            P(stop["action"], action_para_style),
+            P(stop.get("produit", "")),
+            P(stop.get("option", "")),
+            P(str(stop.get("qty_num", ""))),
+            P(stop["client"] or ""),
+            P(stop["address"]),
+            P(str(stop.get("duration_min", "") or "")),
+            P(_fmt_min(stop.get("tw_early")) or ""),
+            P(_fmt_min(stop.get("tw_late")) or ""),
+            P(arr_str, arr_para_style),
+            P(_fmt_min(stop.get("departure_min")) or ""),
         ])
         ri = i + 2
         bg = action_bg.get(stop["action"], colors.HexColor("#F0F0F0"))
         row_styles.append(("BACKGROUND", (1, ri), (1, ri), bg))
-        if stop.get("violated"):
-            row_styles.append(("TEXTCOLOR", (10, ri), (10, ri), colors.HexColor("#DC3545")))
-            row_styles.append(("FONTNAME",  (10, ri), (10, ri), "Helvetica-Bold"))
 
     # Ligne dépôt retour
-    table_data.append(["", "Dépôt – Retour", "", "", "", "", DEPOT_ADDRESS, "", "", "", "", _fmt_min(result.get("return_min")) or ""])
+    table_data.append([
+        P(""), P("🏁 Dépôt retour", depot_row_style), P(""), P(""), P(""),
+        P(""), P(result.get("depot_retour_addr",""), depot_row_style),
+        P(""), P(""), P(""), P(""),
+        P(_fmt_min(result.get("return_min")) or "", depot_row_style)
+    ])
     last = len(table_data) - 1
-    row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD")),
-                   ("FONTNAME",   (0, last), (-1, last), "Helvetica-Bold")]
+    row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD"))]
 
-    stops_table = Table(table_data, colWidths=[7*mm, 20*mm, 18*mm, 14*mm, 8*mm, 18*mm, 40*mm, 10*mm, 12*mm, 12*mm, 12*mm, 12*mm],
-                        repeatRows=1)
+    # Largeur utile A4 avec marges 8mm : 194mm
+    CW = [7*mm, 20*mm, 18*mm, 14*mm, 8*mm, 18*mm, 43*mm, 10*mm, 12*mm, 12*mm, 12*mm, 12*mm]
+    stops_table = Table(table_data, colWidths=CW, repeatRows=1)
     base_style = [
-        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
-        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",    (0, 0), (-1, 0), 10),
-        ("ALIGN",       (0, 0), (-1, 0), "CENTER"),
-        ("FONTNAME",    (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE",    (0, 1), (-1, -1), 9),
-        ("ALIGN",       (0, 1), (-1, -1), "CENTER"),
-        ("ALIGN",       (6, 1), (6, -1), "LEFT"),
-        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -2),
-         [colors.white, colors.HexColor("#F9F9F9")]),
-        ("GRID",        (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-        ("TOPPADDING",  (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN",         (6, 1), (6, -1), "LEFT"),
+        ("ALIGN",         (1, 1), (1, -1), "LEFT"),
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -2), [colors.white, colors.HexColor("#F9F9F9")]),
+        ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
     ]
     stops_table.setStyle(TableStyle(base_style + row_styles))
     story.append(stops_table)
-    story.append(Spacer(1, 8*mm))
+    story.append(Spacer(1, 6*mm))
 
     # ── Carte de la tournée ──
     story.append(Spacer(1, 6*mm))
@@ -817,6 +872,116 @@ def export_pdf(result, tour_date, driver_name):
         story.append(rl_img)
     except Exception as e:
         story.append(Paragraph(f"(Carte non disponible : {e})", styles["Normal"]))
+
+    # ── Checklist par action ──
+    story.append(Spacer(1, 4*mm))
+    story.append(HRFlowable(width="100%", thickness=1,
+                             color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
+    story.append(Paragraph("Checklist par intervention", consigne_title_style))
+
+    ACTION_CHECKLIST = {
+        "Nettoyer": [
+            "Vidanger complètement la cuve",
+            "Nettoyage intérieur avec produit homologué",
+            "Réapprovisionnement papier / gel / savon",
+            "Vérification porte et serrure",
+            "Vérification état général (sol, parois)",
+            "Signalement des dégradations sur la fiche",
+        ],
+        "Déposer": [
+            "Vérification propreté avant remise au client",
+            "Positionnement sur zone désignée",
+            "Vérification stabilité et aplomb",
+            "Remise des consignes d'utilisation (1ère installation)",
+            "Bon de livraison signé par le client",
+        ],
+        "Retirer": [
+            "Vidange de la cuve avant enlèvement",
+            "Nettoyage de la zone après retrait",
+            "Contrôle état de l'équipement (noter dommages)",
+            "Bon de retrait signé par le client",
+        ],
+        "Chargement": [
+            "Contrôle état de l'équipement avant chargement",
+            "Arrimage correct du chargement",
+            "Vérification charge utile respectée",
+            "Vérification feux de la remorque",
+        ],
+        "Déchargement": [
+            "Déchargement avec équipements adaptés",
+            "Contrôle état après déchargement",
+            "Positionnement sur aire de stockage désignée",
+            "Bon de livraison signé",
+        ],
+    }
+
+    action_header_colors_cl = {
+        "Nettoyer":     "#1f6aa5",
+        "Déposer":      "#28a745",
+        "Retirer":      "#dc3545",
+        "Chargement":   "#7B1FA2",
+        "Déchargement": "#E65100",
+    }
+
+    seen_cl = []
+    for stop in result["stops_ordered"]:
+        if stop["action"] not in seen_cl:
+            seen_cl.append(stop["action"])
+
+    for action in seen_cl:
+        checks = ACTION_CHECKLIST.get(action, [])
+        if not checks:
+            continue
+        hcol = colors.HexColor(action_header_colors_cl.get(action, "#555555"))
+        # Bandeau titre action
+        cl_title_data = [[Paragraph(f"&#9632;  {action}", cell_white)]]
+        cl_title_table = Table(cl_title_data, colWidths=[194*mm])
+        cl_title_table.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), hcol),
+            ("TOPPADDING",    (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ]))
+        story.append(cl_title_table)
+
+        # Cases à cocher
+        check_rows = [[
+            Paragraph("☐", check_style),
+            Paragraph(item, check_style)
+        ] for item in checks]
+        cl_table = Table(check_rows, colWidths=[8*mm, 186*mm])
+        cl_table.setStyle(TableStyle([
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ("LEFTPADDING",   (0, 0), (0, -1), 4),
+            ("ROWBACKGROUNDS",(0, 0), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ("GRID",          (0, 0), (-1, -1), 0.3, colors.HexColor("#DDDDDD")),
+        ]))
+        story.append(cl_table)
+        story.append(Spacer(1, 3*mm))
+
+    # ── Annotations / Observations ──
+    story.append(Spacer(1, 4*mm))
+    story.append(HRFlowable(width="100%", thickness=1,
+                             color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
+    story.append(Paragraph("Annotations / Observations", obs_style))
+    story.append(Paragraph(
+        "À remplir par le chauffeur durant ou à l'issue de la tournée :",
+        ParagraphStyle("obs_sub", parent=styles["Normal"], fontSize=8,
+                       textColor=colors.grey, spaceAfter=4)
+    ))
+    # Zone de texte libre (lignes vides)
+    obs_rows = [[""] for _ in range(8)]
+    obs_table = Table(obs_rows, colWidths=[194*mm], rowHeights=[10*mm]*8)
+    obs_table.setStyle(TableStyle([
+        ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("BACKGROUND",    (0, 0), (-1, -1), colors.white),
+        ("TOPPADDING",    (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    story.append(obs_table)
+    story.append(Spacer(1, 4*mm))
 
     # ── Consignes par action ──
     story.append(Spacer(1, 6*mm))
@@ -852,7 +1017,7 @@ def export_pdf(result, tour_date, driver_name):
             continue
         hcol = colors.HexColor(action_header_colors.get(action, "#555555"))
         consigne_data = [[Paragraph(f"■  {action}", action_label_style)]]
-        consigne_table = Table(consigne_data, colWidths=[175*mm])
+        consigne_table = Table(consigne_data, colWidths=[194*mm])
         consigne_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), hcol),
             ("TOPPADDING",    (0, 0), (-1, -1), 4),
@@ -919,7 +1084,19 @@ with st.sidebar:
         value=1.85, step=0.01)
 
     st.divider()
-    st.caption(f"**Dépôt :**\n{DEPOT_ADDRESS}")
+    st.subheader("🏭 Dépôts")
+    st.session_state.depot_depart_addr = st.text_input(
+        "📍 Dépôt de départ",
+        value=st.session_state.depot_depart_addr,
+        placeholder="ex : Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe",
+        help="Adresse complète du point de départ du chauffeur"
+    )
+    st.session_state.depot_retour_addr = st.text_input(
+        "🏁 Dépôt de retour",
+        value=st.session_state.depot_retour_addr,
+        placeholder="ex : Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe",
+        help="Adresse complète du point de retour (peut différer du départ)"
+    )
 
     if st.session_state.result:
         st.divider()
@@ -936,7 +1113,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.title("🚛 Optimiseur de Tournées — Assainissement")
-st.caption(f"🏭 Dépôt fixe : **{DEPOT_ADDRESS}**")
+st.caption(f"🏭 Départ : **{st.session_state.depot_depart_addr}**  →  Retour : **{st.session_state.depot_retour_addr}**")
 
 tab_saisie, tab_optim, tab_export = st.tabs([
     "📋  Saisie des arrêts",
@@ -952,7 +1129,8 @@ with tab_saisie:
     st.subheader("Saisie des arrêts de la tournée")
     st.info(
         f"💡 Saisissez vos arrêts ci-dessous. "
-        f"Départ et retour au dépôt (**{DEPOT_ADDRESS}**) sont automatiques. "
+        f"Départ : **{st.session_state.depot_depart_addr}** · "
+        f"Retour : **{st.session_state.depot_retour_addr}**. "
         f"L'ordre de saisie n'a pas d'importance.")
 
     # ── Fusion des éditions en cours dans df_stops avant tout bouton ──
@@ -1118,8 +1296,25 @@ with tab_saisie:
         ].reset_index(drop=True)
 
         with st.spinner("🔍 Géocodage des adresses en cours…"):
-            depot_coords = DEPOT_COORDS
-            pb           = st.progress(0, text="Géocodage…")
+            # Géocodage des dépôts
+            depot_depart_addr = st.session_state.depot_depart_addr.strip()
+            depot_retour_addr = st.session_state.depot_retour_addr.strip()
+            if not depot_depart_addr:
+                st.error("❌ Veuillez renseigner le **Dépôt de départ** dans la barre latérale.")
+                st.stop()
+            depot_coords = geocode(depot_depart_addr)
+            if not depot_coords:
+                st.error(f"❌ Impossible de géocoder le dépôt de départ : {depot_depart_addr}")
+                st.stop()
+            if depot_retour_addr and depot_retour_addr != depot_depart_addr:
+                depot_retour_coords = geocode(depot_retour_addr)
+                if not depot_retour_coords:
+                    st.warning(f"⚠️ Dépôt de retour introuvable, le dépôt de départ sera utilisé.")
+                    depot_retour_coords = depot_coords
+            else:
+                depot_retour_coords = depot_coords
+
+            pb           = st.progress(0, text="Géocodage des arrêts…")
             geo          = {}
             all_addrs    = valid_stops["Adresse"].tolist()
             for i, addr in enumerate(all_addrs):
@@ -1273,23 +1468,42 @@ with tab_saisie:
                 )
             st.warning("  \n".join(lines))
 
-        return_min = (
-            (stops_ordered[-1]["departure_min"] or stops_ordered[-1]["arrival_min"] or depart_min)
-            + (trip["matrix"][order[-1]][order[0]] or 0) / 60
-        ) if stops_ordered else depart_min
+        # Temps de retour au dépôt de retour via OSRM /route
+        if stops_ordered:
+            last_stop_coords = [s for s in [
+                (stops_ordered[-1]["lat"], stops_ordered[-1]["lon"])
+            ] if s[0] is not None]
+            if last_stop_coords and depot_retour_coords:
+                try:
+                    ret_coord_str = f"{last_stop_coords[0][1]},{last_stop_coords[0][0]};{depot_retour_coords[1]},{depot_retour_coords[0]}"
+                    ret_r = requests.get(f"{OSRM_URL}/route/v1/driving/{ret_coord_str}",
+                                         params={"overview": "false"}, timeout=10)
+                    ret_data = ret_r.json()
+                    travel_back = ret_data["routes"][0]["duration"] / 60 if ret_data.get("code") == "Ok" else 0
+                except Exception:
+                    travel_back = (trip["matrix"][order[-1]][order[0]] or 0) / 60
+            else:
+                travel_back = 0
+            last_dep = stops_ordered[-1]["departure_min"] or stops_ordered[-1]["arrival_min"] or depart_min
+            return_min = last_dep + travel_back
+        else:
+            return_min = depart_min
 
         st.session_state.result = {
-            "stops_ordered":  stops_ordered,
-            "distance_km":    dist_km,
-            "duration_min":   dur_min,
-            "fuel_liters":    fuel_l,
-            "fuel_cost":      fuel_cost,
-            "km_saved":       km_saved,
-            "time_saved_min": min_saved,
-            "geometry":       trip["geometry"],
-            "depot_coords":   depot_coords,
-            "depart_min":     depart_min,
-            "return_min":     return_min,
+            "stops_ordered":      stops_ordered,
+            "distance_km":        dist_km,
+            "duration_min":       dur_min,
+            "fuel_liters":        fuel_l,
+            "fuel_cost":          fuel_cost,
+            "km_saved":           km_saved,
+            "time_saved_min":     min_saved,
+            "geometry":           trip["geometry"],
+            "depot_coords":       depot_coords,
+            "depot_retour_coords":depot_retour_coords,
+            "depot_depart_addr":  depot_depart_addr,
+            "depot_retour_addr":  depot_retour_addr,
+            "depart_min":         depart_min,
+            "return_min":         return_min,
         }
         st.success("✅ Tournée optimisée ! Consultez l'onglet **Tournée optimisée**.")
         st.rerun()
@@ -1336,14 +1550,17 @@ with tab_optim:
 
         with col_map:
             st.subheader("🗺️ Carte de la tournée")
-            m = build_map(r["depot_coords"], r["stops_ordered"], r["geometry"])
+            m = build_map(r["depot_coords"], r["stops_ordered"], r["geometry"],
+                          depot_depart_addr=r.get("depot_depart_addr","Dépôt départ"),
+                          depot_retour_addr=r.get("depot_retour_addr"),
+                          depot_retour_coords=r.get("depot_retour_coords"))
             st_folium(m, use_container_width=True, height=520, returned_objects=[])
 
         with col_list:
             st.subheader("📋 Ordre des arrêts")
             st.markdown(
                 f'<div class="stop-card depot-card"><b>🏭 Dépôt — Départ</b><br>'
-                f'<small>{DEPOT_ADDRESS}</small></div>', unsafe_allow_html=True)
+                f'<small>{r.get("depot_depart_addr","")}</small></div>', unsafe_allow_html=True)
             for stop in r["stops_ordered"]:
                 bg  = ACTION_COLORS.get(stop["action"], "#f0f0f0")
                 brd = ACTION_BORDER_COLORS.get(stop["action"], "#999")
@@ -1383,8 +1600,8 @@ with tab_optim:
             retour_html = (f"<br><small style='color:#1f4e79;font-weight:600'>🏁 Retour estimé : {retour_str}</small>"
                            if retour_str else "")
             st.markdown(
-                f'<div class="stop-card depot-card"><b>🏭 Dépôt — Retour</b><br>'
-                f'<small>{DEPOT_ADDRESS}</small>{retour_html}</div>',
+                f'<div class="stop-card depot-card"><b>🏁 Dépôt — Retour</b><br>'
+                f'<small>{r.get("depot_retour_addr","")}</small>{retour_html}</div>',
                 unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
