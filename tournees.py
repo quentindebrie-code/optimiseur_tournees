@@ -30,7 +30,7 @@ from reportlab.lib.enums import TA_CENTER
 
 DEPOTS = {
     "Saint-Sulpice":   "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe",
-    "Villemur-sur-Tarn": "1 E Avenue du Président Roosevelt 31340 Villemur-sur-Tarn",
+    "Villemur-sur-Tarn": "11 Allée des Tailladettes, 31620 Labastide-Saint-Sernin",
 }
 DEPOT_DEPART_DEFAULT = "Saint-Sulpice"
 DEPOT_RETOUR_DEFAULT = "Saint-Sulpice"
@@ -726,9 +726,17 @@ def export_pdf(result, tour_date, driver_name):
                                  textColor=colors.white)
     check_style = ParagraphStyle("check", parent=styles["Normal"],
                                  fontSize=9, leading=13, leftIndent=4)
-    obs_style   = ParagraphStyle("obs_title", parent=styles["Normal"],
+    obs_style          = ParagraphStyle("obs_title", parent=styles["Normal"],
                                  fontSize=11, fontName="Helvetica-Bold",
                                  textColor=colors.HexColor("#1F4E79"), spaceAfter=2)
+    consigne_title_style = ParagraphStyle("consigne_title", parent=styles["Heading2"],
+                                          fontSize=12, textColor=colors.HexColor("#1F4E79"),
+                                          spaceAfter=4)
+    action_label_style   = ParagraphStyle("action_label", parent=styles["Normal"],
+                                          fontSize=10, fontName="Helvetica-Bold",
+                                          textColor=colors.white, spaceAfter=2)
+    consigne_text_style  = ParagraphStyle("consigne_text", parent=styles["Normal"],
+                                          fontSize=9, leftIndent=4, spaceAfter=8)
 
     story = []
 
@@ -991,16 +999,7 @@ def export_pdf(result, tour_date, driver_name):
     story.append(Spacer(1, 6*mm))
     story.append(HRFlowable(width="100%", thickness=1,
                              color=colors.HexColor("#1F4E79"), spaceBefore=4, spaceAfter=6))
-    consigne_title_style = ParagraphStyle("consigne_title", parent=styles["Heading2"],
-                                           fontSize=12, textColor=colors.HexColor("#1F4E79"),
-                                           spaceAfter=4)
     story.append(Paragraph("Consignes par type d'intervention", consigne_title_style))
-
-    action_label_style = ParagraphStyle("action_label", parent=styles["Normal"],
-                                         fontSize=10, fontName="Helvetica-Bold",
-                                         textColor=colors.white, spaceAfter=2)
-    consigne_text_style = ParagraphStyle("consigne_text", parent=styles["Normal"],
-                                          fontSize=9, leftIndent=4, spaceAfter=8)
 
     action_header_colors = {
         "Nettoyer":     "#1f6aa5",
