@@ -1084,22 +1084,29 @@ with tab_saisie:
     n_valid    = len(valid_rows)
     st.caption(f"📍 **{n_valid}** arrêt(s) avec adresse renseignée")
 
-    # Avertissement WC sans urinoir ni lave-main
-    wc_keywords  = ["wc", "w.c", "toilette"]
-    lm_keywords  = ["lave main", "lave-main", "urinoir"]
-    wc_rows = valid_rows[
-        valid_rows["Quantité"].str.lower().str.contains("|".join(wc_keywords), na=False)
-        & ~valid_rows["Quantité"].str.lower().str.contains("|".join(lm_keywords), na=False)
-        & ~valid_rows["Quantité"].str.lower().str.contains("handicap", na=False)
-    ]
-    if len(wc_rows) > 0:
-        st.warning(
-            f"🚽 **{len(wc_rows)} arrêt(s) avec WC seul(s) détecté(s).** "
-            "La réglementation impose l'installation d'un **urinoir** ou d'un "
-            "**lave-main** à proximité de tout WC chimique dans les espaces de travail "
-            "(Code du travail, art. R4228-7). Pensez à vérifier si cette obligation s'applique "
-            "et à ajouter la quantité correspondante (ex : *1 WC + 1 Urinoir*)."
-        )
+    # Validation Produit / Option
+    if "Produit" in live_df.columns and "Option" in live_df.columns:
+        wc_rows_no_opt = valid_rows[
+            (valid_rows["Produit"] == "WC chimique") &
+            (valid_rows["Option"].fillna("").str.strip() == "")
+        ]
+        if len(wc_rows_no_opt) > 0:
+            st.warning(
+                f"\U0001f6bd **{len(wc_rows_no_opt)} arr\u00eat(s) avec WC chimique sans option.** "
+                "Chaque WC chimique doit \u00eatre accompagn\u00e9 d'un **Urinoir** ou d'un "
+                "**Lave-main** (Code du travail, art. R4228-7). "
+                "S\u00e9lectionnez une option dans la colonne *Option*."
+            )
+        non_wc_with_opt = valid_rows[
+            (valid_rows["Produit"] != "WC chimique") &
+            (valid_rows["Option"].fillna("").str.strip() != "")
+        ]
+        if len(non_wc_with_opt) > 0:
+            st.info(
+                f"\u2139\ufe0f **{len(non_wc_with_opt)} arr\u00eat(s)** ont une option renseign\u00e9e "
+                "alors que le produit n'est pas un WC chimique — "
+                "la colonne *Option* sera ignor\u00e9e pour ces lignes."
+            )
 
     st.markdown("---")
 
