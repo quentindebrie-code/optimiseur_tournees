@@ -30,7 +30,7 @@ from reportlab.lib.enums import TA_CENTER
 
 DEPOTS = {
     "Saint-Sulpice":   "Imp. Gaston Phoebus, 81370 Saint-Sulpice-la-Pointe",
-    "Villemur-sur-Tarn": "1 E Avenue du Président Roosevelt 31340 Villemur-sur-Tarn",
+    "Villemur-sur-Tarn": "1 Avenue du Président Roosevelt 31340 Villemur-sur-Tarn",
 }
 DEPOT_DEPART_DEFAULT = "Saint-Sulpice"
 DEPOT_RETOUR_DEFAULT = "Saint-Sulpice"
