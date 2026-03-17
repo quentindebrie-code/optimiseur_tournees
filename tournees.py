@@ -104,7 +104,7 @@ ACTION_CONSIGNES = {
 # CONFIG PAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Optimiseur de Tournées", page_icon="🚛",
+st.set_page_config(page_title="Optimiseur de Tournées", page_icon="",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
