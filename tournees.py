@@ -131,6 +131,7 @@ def _init_df():
         "Durée (min)":   [30,            30,            30],
         "Pas avant":     ["",            "",            ""],
         "Pas après":     ["",            "",            ""],
+        "Observations":  ["",            "",            ""],
     })
 
 if "df_stops"          not in st.session_state: st.session_state.df_stops          = _init_df()
@@ -792,7 +793,7 @@ def export_pdf(result, tour_date, driver_name):
                                 textColor=colors.white, alignment=1)
     table_data = [[P(h, hdr_style) for h in
                    ["N°", "Action", "Produit", "Option", "Qté",
-                    "Client", "Adresse", "Durée", "Pav.", "Pap.", "Arr.", "Dép."]]]
+                    "Client", "Adresse", "Durée", "Pav.", "Pap.", "Arr.", "Dép.", "Obs."]]]
     row_styles = []
 
     depot_row_style = ParagraphStyle("dep_row", parent=styles["Normal"],
@@ -803,7 +804,7 @@ def export_pdf(result, tour_date, driver_name):
         P(""), P("🏭 Dépôt départ", depot_row_style), P(""), P(""), P(""),
         P(""), P(result.get("depot_depart_addr",""), depot_row_style),
         P(""), P(""), P(""),
-        P(_fmt_min(result.get("depart_min")) or "", depot_row_style), P("")
+        P(_fmt_min(result.get("depart_min")) or "", depot_row_style), P(""), P("")
     ])
     row_styles += [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#FFF3CD"))]
 
@@ -832,6 +833,7 @@ def export_pdf(result, tour_date, driver_name):
             P(_fmt_min(stop.get("tw_late")) or ""),
             P(arr_str, arr_para_style),
             P(_fmt_min(stop.get("departure_min")) or ""),
+            P(stop.get("observations", "") or ""),
         ])
         ri = i + 2
         bg = action_bg.get(stop["action"], colors.HexColor("#F0F0F0"))
@@ -842,19 +844,22 @@ def export_pdf(result, tour_date, driver_name):
         P(""), P("🏁 Dépôt retour", depot_row_style), P(""), P(""), P(""),
         P(""), P(result.get("depot_retour_addr",""), depot_row_style),
         P(""), P(""), P(""), P(""),
-        P(_fmt_min(result.get("return_min")) or "", depot_row_style)
+        P(_fmt_min(result.get("return_min")) or "", depot_row_style), P("")
     ])
     last = len(table_data) - 1
     row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD"))]
 
     # Largeur utile A4 avec marges 8mm : 194mm
-    CW = [7*mm, 28*mm, 26*mm, 20*mm, 8*mm, 18*mm, 35*mm, 10*mm, 12*mm, 12*mm, 12*mm, 12*mm]
+    # N°=7, Action=25, Produit=23, Option=17, Qté=7, Client=16, Adresse=30,
+    # Durée=9, Pav.=10, Pap.=10, Arr.=10, Dép.=10, Obs.=20  → total=194mm
+    CW = [7*mm, 25*mm, 23*mm, 17*mm, 7*mm, 16*mm, 30*mm, 9*mm, 10*mm, 10*mm, 10*mm, 10*mm, 20*mm]
     stops_table = Table(table_data, colWidths=CW, repeatRows=1)
     base_style = [
         ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
         ("ALIGN",         (6, 1), (6, -1), "LEFT"),
         ("ALIGN",         (1, 1), (3, -1), "LEFT"),
+        ("ALIGN",         (12, 1), (12, -1), "LEFT"),
         ("NOSPLIT",        (1, 1), (3, -1)),
         ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ("ROWBACKGROUNDS",(0, 1), (-1, -2), [colors.white, colors.HexColor("#F9F9F9")]),
@@ -1169,6 +1174,7 @@ with tab_saisie:
                 "Option": ["Lave-main"], "Quantité": [1],
                 "Nom du client": [""], "Adresse": [""],
                 "Durée (min)": [30], "Pas avant": [""], "Pas après": [""],
+                "Observations": [""],
             })
             st.session_state.df_stops = pd.concat(
                 [st.session_state.df_stops, new_row], ignore_index=True)
@@ -1236,6 +1242,9 @@ with tab_saisie:
             "Pas après": st.column_config.TextColumn(
                 "⏰ Pas après", width="small",
                 help="Arriver au plus tard à cette heure (format HH:MM). Ex : 11:30"),
+            "Observations": st.column_config.TextColumn(
+                "📝 Observations", width="large",
+                help="Notes ou remarques particulières pour cet arrêt (ex : code portail, contact sur place…)"),
         },
         hide_index=False,
         key="editor_stops",
@@ -1449,6 +1458,7 @@ with tab_saisie:
                 "departure_min":arr.get("departure_min"),
                 "wait_min":     arr.get("wait_min", 0),
                 "violated":     arr.get("violated", False),
+                "observations": str(row.get("Observations", "") or ""),
             })
             rank    += 1
             arr_idx += 1
@@ -1640,7 +1650,7 @@ with tab_export:
                                  st.session_state.driver)
             st.download_button(
                 "⬇️ Télécharger PDF", data=pdf_buf,
-                file_name=f"tournee_{st.session_state.tour_date.strftime('%Y%m%d')}.pdf",
+                file_name=f"Tournee_WC_{st.session_state.tour_date.strftime('%d-%m-%Y')}.pdf",
                 mime="application/pdf",
                 use_container_width=True, type="primary")
 
