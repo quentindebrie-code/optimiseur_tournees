@@ -1122,7 +1122,7 @@ with st.sidebar:
 # ONGLETS
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("Optimiseur automatique des tournées - Deldossi Assainissement")
+st.title("Optimisation Tournées WC chimiques - Deldossi Assainissement")
 st.caption(f"🏭 Départ : **{st.session_state.depot_depart_key}** · Retour : **{st.session_state.depot_retour_key}**")
 
 tab_saisie, tab_optim, tab_export = st.tabs([
