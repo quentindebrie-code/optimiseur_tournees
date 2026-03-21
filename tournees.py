@@ -1638,7 +1638,7 @@ with tab_export:
                                   st.session_state.driver, fuel_price)
             st.download_button(
                 "⬇️ Télécharger Excel", data=xl_buf,
-                file_name=f"tournee_WC{st.session_state.tour_date.strftime('%d-%-m%Y')}.xlsx",
+                file_name=f"Tournee_WC_{st.session_state.tour_date.strftime('%d-%m-%Y')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True, type="primary")
 
