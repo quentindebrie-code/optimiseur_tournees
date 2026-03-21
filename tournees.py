@@ -630,7 +630,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         "Déchargement": PatternFill("solid", fgColor="FFE0B2"),
     }
 
-    ws.merge_cells("A1:G1")
+    ws.merge_cells("A1:N1")
     c = ws["A1"]
     c.value     = f"FEUILLE DE TOURNÉE – {tour_date.strftime('%d/%m/%Y')}"
     c.font      = Font(bold=True, size=15, color="1F4E79")
@@ -650,11 +650,11 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         ws.cell(r, 1).value = label + " :"
         ws.cell(r, 1).font  = bold_f
         ws.cell(r, 2).value = val
-        ws.merge_cells(f"B{r}:G{r}")
+        ws.merge_cells(f"B{r}:N{r}")
         ws.cell(r, 2).alignment = left
     ws.append([])
 
-    headers = ["Ordre", "Action", "Produit", "Option", "Qté", "Nom du client", "Adresse", "Durée (min)", "Pas avant", "Pas après", "Arrivée", "Départ", "✓ Fait"]
+    headers = ["Ordre", "Action", "Produit", "Option", "Qté", "Nom du client", "Adresse", "Durée (min)", "Pas avant", "Pas après", "Arrivée", "Départ", "Observations", "✓ Fait"]
     ws.append(headers)
     hr = ws.max_row
     for col, h in enumerate(headers, 1):
@@ -673,27 +673,28 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
                    _fmt_min(stop.get("tw_late")),
                    _fmt_min(stop.get("arrival_min")),
                    _fmt_min(stop.get("departure_min")),
+                   stop.get("observations", "") or "",
                    ""])
         r = ws.max_row
-        for col in range(1, 14):
+        for col in range(1, 15):
             c = ws.cell(r, col)
             c.border = brd
-            c.alignment = center if col != 7 else left
+            c.alignment = center if col not in (7, 13) else left
             if col == 11 and stop.get("violated"):
                 c.font = Font(bold=True, color="DC3545")
         ws.cell(r, 2).fill = action_fills.get(stop["action"],
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
 
-    ws.append(["↩", "Retour dépôt", "", "", "", "", result.get("depot_retour_addr",""), "", "", "", "", "", ""])
+    ws.append(["↩", "Retour dépôt", "", "", "", "", result.get("depot_retour_addr",""), "", "", "", "", "", "", ""])
     r = ws.max_row
-    for col in range(1, 14):
+    for col in range(1, 15):
         c = ws.cell(r, col)
         c.fill = PatternFill("solid", fgColor="FFF3CD")
         c.font = bold_f; c.border = brd
-        c.alignment = center if col != 7 else left
+        c.alignment = center if col not in (7, 13) else left
 
-    for col, width in zip(range(1, 14), [8, 14, 16, 14, 6, 22, 44, 12, 12, 12, 12, 12, 8]):
+    for col, width in zip(range(1, 15), [8, 14, 16, 14, 6, 22, 44, 12, 12, 12, 12, 12, 30, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
     buf = BytesIO()
@@ -1638,7 +1639,7 @@ with tab_export:
                                   st.session_state.driver, fuel_price)
             st.download_button(
                 "⬇️ Télécharger Excel", data=xl_buf,
-                file_name=f"Tournee_WC_{st.session_state.tour_date.strftime('%d-%m-%Y')}.xlsx",
+                file_name=f"tournee_{st.session_state.tour_date.strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True, type="primary")
 
