@@ -363,8 +363,8 @@ def _two_opt(tour, matrix, depart_min=None, time_windows=None):
 
 # Coordonnées approximatives du centre de Toulouse et du périphérique (rocade)
 _TOULOUSE_CENTER  = (43.6047, 1.4442)
-_PERI_INNER_KM    = 3.5   # < 3,5 km du centre = intra-rocade (hypercentre)
-_PERI_OUTER_KM    = 13.0  # > 13 km du centre  = hors zone Toulouse
+_PERI_INNER_KM    = 20.0   # < 3,5 km du centre = intra-rocade (hypercentre)
+_PERI_OUTER_KM    = 20.0  # > 13 km du centre  = hors zone Toulouse
 
 
 def _haversine_km(coord_a, coord_b):
