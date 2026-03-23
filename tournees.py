@@ -361,10 +361,9 @@ def _two_opt(tour, matrix, depart_min=None, time_windows=None):
 # HEURISTIQUE PÉRIPHÉRIQUE TOULOUSAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Coordonnées approximatives du centre de Toulouse et du périphérique (rocade)
+# Centre géographique de Toulouse et rayon de la rocade
 _TOULOUSE_CENTER  = (43.6047, 1.4442)
-_PERI_INNER_KM    = 20.0   # < 3,5 km du centre = intra-rocade (hypercentre)
-_PERI_OUTER_KM    = 20.0  # > 13 km du centre  = hors zone Toulouse
+_ROCADE_RAYON_KM  = 10.0   # seuil : < 10 km du centre = intra-rocade
 
 
 def _haversine_km(coord_a, coord_b):
@@ -377,44 +376,85 @@ def _haversine_km(coord_a, coord_b):
     return 6371 * 2 * math.asin(math.sqrt(a))
 
 
-def _passe_par_peripherique(coord_a, coord_b):
+def _est_intra_rocade(coord):
     """
-    Heuristique : le trajet entre coord_a et coord_b emprunte-t-il
-    probablement le périphérique toulousain (rocade) ?
+    Retourne True si le point est à l'intérieur de la rocade toulousaine
+    (distance au centre < _ROCADE_RAYON_KM).
+    """
+    return _haversine_km(coord, _TOULOUSE_CENTER) < _ROCADE_RAYON_KM
+
+
+# Bornes horaires des heures de pointe (minutes depuis minuit)
+_POINTE_MATIN_DEBUT  = 7  * 60        # 07:00
+_POINTE_MATIN_FIN    = 9  * 60        # 09:00
+_POINTE_SOIR_DEBUT   = 17 * 60        # 17:00
+_POINTE_SOIR_FIN     = 19 * 60        # 19:00
+_FIN_POINTE_MATIN    = _POINTE_MATIN_FIN        # les arrêts intra-rocade ne commencent pas avant
+_DEBUT_POINTE_SOIR   = _POINTE_SOIR_DEBUT - 30  # les arrêts intra-rocade se terminent avant
+
+
+def _injecte_contraintes_peri(time_windows, coords_list, depart_min):
+    """
+    Quand le mode périphérique est activé et qu'on est en heure de pointe,
+    injecte des contraintes horaires automatiques sur les arrêts intra-rocade
+    pour que le chauffeur les traite en dehors des bouchons.
 
     Logique :
-    - Si l'un des deux points est dans la zone couverte par la rocade
-      (< 13 km du centre de Toulouse) et que la distance entre les deux
-      points est supérieure à 6 km, le trajet croise très probablement
-      la rocade ou en longe une portion significative.
-    - Les trajets entièrement hors de la zone toulousaine sont exclus.
+    - Pointe matin (07h–09h) : arrêts intra-rocade → earliest = 09:00
+      (le chauffeur fait d'abord les arrêts extérieurs, entre en ville après 9h)
+    - Pointe soir  (17h–19h) : arrêts intra-rocade → latest  = 16:30
+      (le chauffeur termine les arrêts en centre-ville avant les bouchons du soir)
+
+    Les contraintes existantes saisies par l'utilisateur sont respectées :
+    - earliest injecté = max(earliest_utilisateur, 09:00)
+    - latest  injecté  = min(latest_utilisateur,   16:30)
+
+    Retourne (time_windows_modifiées, liste_des_indices_arrêts_affectés).
+    coords_list[0] = dépôt, coords_list[k] = arrêt k.
     """
-    dist_a_centre = _haversine_km(coord_a, _TOULOUSE_CENTER)
-    dist_b_centre = _haversine_km(coord_b, _TOULOUSE_CENTER)
-    dist_ab       = _haversine_km(coord_a, coord_b)
+    pointe_matin = _POINTE_MATIN_DEBUT <= depart_min <= _POINTE_MATIN_FIN
+    pointe_soir  = _POINTE_SOIR_DEBUT  <= depart_min <= _POINTE_SOIR_FIN
 
-    # Au moins un point dans la zone d'influence du périphérique
-    proche_peri = (dist_a_centre < _PERI_OUTER_KM) or (dist_b_centre < _PERI_OUTER_KM)
-    # Trajet suffisamment long pour impliquer la rocade
-    trajet_long = dist_ab > 6.0
-    return proche_peri and trajet_long
+    if not (pointe_matin or pointe_soir):
+        return time_windows, []   # hors pointe : rien à injecter
+
+    tw_modif  = [tw.copy() for tw in time_windows]   # copie pour ne pas altérer l'original
+    affectes  = []
+
+    for k, coord in enumerate(coords_list[1:], start=1):   # index 0 = dépôt, ignoré
+        if not _est_intra_rocade(coord):
+            continue   # arrêt hors rocade : pas de contrainte injectée
+
+        tw = tw_modif[k]
+        modifie = False
+
+        if pointe_matin:
+            # Pas avant 09:00 (ou la contrainte utilisateur si elle est plus tardive)
+            seuil = _FIN_POINTE_MATIN
+            if tw["earliest"] is None or tw["earliest"] < seuil:
+                tw["earliest"] = seuil
+                modifie = True
+
+        if pointe_soir:
+            # Pas après 16:30 (ou la contrainte utilisateur si elle est plus tôt)
+            seuil = _DEBUT_POINTE_SOIR
+            if tw["latest"] is None or tw["latest"] > seuil:
+                tw["latest"] = seuil
+                modifie = True
+
+        if modifie:
+            affectes.append(k)
+
+    return tw_modif, affectes
 
 
-def osrm_trip(coords_latlon, time_windows=None, depart_min=None,
-              eviter_peri=False, traffic_ref_min=None):
+def osrm_trip(coords_latlon, time_windows=None, depart_min=None):
     """
     Optimisation TSP depot fixe avec fenêtres temporelles optionnelles.
     1. Matrice de durees OSRM (/table)
-    2. [Optionnel] Malus embouteillages périphérique toulousain
-    3. Nearest-neighbor depuis le depot (index 0)
-    4. Amelioration 2-opt (avec TW si fournis)
-    5. Route finale (/route) pour geometrie et distances reelles
-
-    Paramètres :
-        eviter_peri     : active le malus périphérique si True
-        traffic_ref_min : heure de référence (minutes depuis minuit) utilisée
-                          pour détecter les heures de pointe (indépendant de
-                          depart_min qui sert à l'optimisation TW)
+    2. Nearest-neighbor depuis le depot (index 0)
+    3. Amelioration 2-opt (avec TW si fournis)
+    4. Route finale (/route) pour geometrie et distances reelles
     """
     n         = len(coords_latlon)
     coord_str = ";".join(f"{lon},{lat}" for lat, lon in coords_latlon)
@@ -431,27 +471,8 @@ def osrm_trip(coords_latlon, time_windows=None, depart_min=None,
         st.error(f"OSRM table error : {data.get('code')}")
         return None
 
-    matrix_real = data["durations"]   # matrice originale OSRM (durées réelles en secondes)
-                                       # conservée intacte pour le calcul des ETAs à l'affichage
-
-    # Etape 2 : malus embouteillages périphérique toulousain (optionnel)
-    # On travaille sur une COPIE pour ne pas polluer les ETAs affichées.
-    _ref_min = traffic_ref_min if traffic_ref_min is not None else depart_min
-    _malus_actif = False
-    if eviter_peri and _ref_min is not None:
-        _heure_pointe = (7 * 60 <= _ref_min <= 9 * 60) or (17 * 60 <= _ref_min <= 19 * 60)
-        if _heure_pointe:
-            _MALUS_PERI  = 1.35   # +35 % sur les durées des trajets via le périphérique
-            _malus_actif = True
-            matrix = [row[:] for row in matrix_real]   # copie profonde de la matrice
-            for _i in range(n):
-                for _j in range(n):
-                    if _i != _j and _passe_par_peripherique(coords_latlon[_i], coords_latlon[_j]):
-                        matrix[_i][_j] = (matrix[_i][_j] or 0) * _MALUS_PERI
-        else:
-            matrix = matrix_real   # hors pointe : pas de copie nécessaire
-    else:
-        matrix = matrix_real
+    matrix      = data["durations"]   # liste n x n de durees en secondes
+    matrix_real = matrix              # alias explicite — durées réelles OSRM pour les ETAs
 
     # Etape 3 : nearest-neighbor depuis le depot
     unvisited = list(range(1, n))
@@ -491,9 +512,8 @@ def osrm_trip(coords_latlon, time_windows=None, depart_min=None,
         "distance_km":  route["distance"] / 1000,
         "duration_min": route["duration"] / 60,
         "geometry":     geom,
-        "matrix":       matrix,        # matrice pénalisée (utilisée pour l'optimisation)
-        "matrix_real":  matrix_real,   # matrice réelle OSRM (utilisée pour les ETAs)
-        "malus_actif":  _malus_actif,  # True si le malus périphérique a été appliqué
+        "matrix":       matrix,       # = matrix_real (durées OSRM réelles)
+        "matrix_real":  matrix_real,  # alias conservé pour la compatibilité
     }
 
 
@@ -1194,26 +1214,33 @@ with st.sidebar:
         value=st.session_state.eviter_peri,
         on_change=_on_peri_change,
         help=(
-            "Active un malus de +35 % sur les durées des trajets passant par "
-            "le périphérique de Toulouse (rocade), si l'heure de départ se situe "
-            "en heure de pointe : 07h–09h ou 17h–19h.\n\n"
-            "L'optimiseur privilégiera alors des itinéraires évitant la rocade "
-            "ou réorganisera les arrêts pour contourner les créneaux chargés."
+            "En heure de pointe (07h–09h ou 17h–19h), reporte automatiquement "
+            "les arrêts situés à l'intérieur de la rocade toulousaine :\n\n"
+            "• Pointe matin → arrêts intra-rocade planifiés après 09:00\n"
+            "• Pointe soir  → arrêts intra-rocade planifiés avant 16:30\n\n"
+            "Le chauffeur traite d'abord les arrêts extérieurs pendant les bouchons, "
+            "puis entre en ville une fois la circulation fluide."
         ),
     )
     if st.session_state.eviter_peri:
-        hm = st.session_state.heure_min_depart
-        _ref = hm.hour * 60 + hm.minute
-        _pointe = (7 * 60 <= _ref <= 9 * 60) or (17 * 60 <= _ref <= 19 * 60)
-        if _pointe:
+        hm    = st.session_state.heure_min_depart
+        _ref  = hm.hour * 60 + hm.minute
+        _mat  = _POINTE_MATIN_DEBUT <= _ref <= _POINTE_MATIN_FIN
+        _soir = _POINTE_SOIR_DEBUT  <= _ref <= _POINTE_SOIR_FIN
+        if _mat:
             st.warning(
-                f"⚠️ Départ à **{hm.strftime('%H:%M')}** — heure de pointe détectée. "
-                "Le malus périphérique (+35 %) sera appliqué à l'optimisation."
+                f"⚠️ Départ à **{hm.strftime('%H:%M')}** — pointe matin.\n\n"
+                "Les arrêts intra-rocade seront repoussés après **09:00**."
+            )
+        elif _soir:
+            st.warning(
+                f"⚠️ Départ à **{hm.strftime('%H:%M')}** — pointe soir.\n\n"
+                "Les arrêts intra-rocade seront planifiés avant **16:30**."
             )
         else:
             st.info(
                 f"ℹ️ Départ à **{hm.strftime('%H:%M')}** — hors heure de pointe. "
-                "Le malus périphérique ne s'appliquera pas (trafic normal)."
+                "Aucun report automatique ne sera appliqué."
             )
 
     if st.session_state.result:
@@ -1474,18 +1501,23 @@ with tab_saisie:
                     "duration": dur,
                 })
 
-        with st.spinner("🗺️ Calcul de l'itinéraire optimisé…"):
-            # Borne légale / réglementaire configurée dans la sidebar
-            # (calculée ici pour être disponible dans osrm_trip dès la 1ère passe)
-            legal_min = (st.session_state.heure_min_depart.hour * 60
-                         + st.session_state.heure_min_depart.minute)
-            eviter_peri = st.session_state.eviter_peri
+        # ── Mode périphérique ──
+        # Si activé et heure de pointe, on injecte des contraintes horaires sur les
+        # arrêts intra-rocade AVANT de lancer l'optimiseur. Le moteur TW fera le reste :
+        # il planifiera les arrêts extérieurs pendant les bouchons, et les arrêts
+        # en centre-ville une fois la circulation fluide.
+        eviter_peri  = st.session_state.eviter_peri
+        legal_min    = (st.session_state.heure_min_depart.hour * 60
+                        + st.session_state.heure_min_depart.minute)
+        peri_affectes = []   # indices des arrêts dont les TW ont été injectées automatiquement
+        if eviter_peri:
+            time_windows, peri_affectes = _injecte_contraintes_peri(
+                time_windows, coords_list, legal_min
+            )
 
+        with st.spinner("🗺️ Calcul de l'itinéraire optimisé…"):
             # Première passe sans heure de départ (ordre pur)
-            # traffic_ref_min = legal_min : permet d'appliquer le malus
-            # périphérique dès cette passe si l'on est en heure de pointe.
-            trip = osrm_trip(coords_list, time_windows=time_windows, depart_min=None,
-                             eviter_peri=eviter_peri, traffic_ref_min=legal_min)
+            trip = osrm_trip(coords_list, time_windows=time_windows, depart_min=None)
             if not trip:
                 st.stop()
             orig = osrm_route_distance(coords_list)
@@ -1529,21 +1561,15 @@ with tab_saisie:
             )
 
         # Seconde passe 2-opt avec l'heure de départ calculée.
-        # Déclenchée si des contraintes horaires existent OU si le malus
-        # périphérique est activé (pour affiner l'ordre avec la vraie heure de pointe).
+        # Si le mode périphérique a injecté des contraintes intra-rocade,
+        # peri_affectes est non vide → has_tw sera True et la passe s'exécutera.
         has_tw = any(
             tw.get("earliest") is not None or tw.get("latest") is not None
             for tw in time_windows[1:]
         )
-        if has_tw or eviter_peri:
-            _spinner_msg = (
-                "⚙️ Affinage de l'ordre selon les contraintes horaires…"
-                if has_tw
-                else "🚦 Affinage de l'itinéraire avec prise en compte du périphérique…"
-            )
-            with st.spinner(_spinner_msg):
-                trip2 = osrm_trip(coords_list, time_windows=time_windows, depart_min=depart_min,
-                                  eviter_peri=eviter_peri, traffic_ref_min=depart_min)
+        if has_tw:
+            with st.spinner("⚙️ Affinage de l'ordre selon les contraintes horaires…"):
+                trip2 = osrm_trip(coords_list, time_windows=time_windows, depart_min=depart_min)
                 if trip2:
                     trip = trip2
 
@@ -1646,13 +1672,8 @@ with tab_saisie:
             "depot_retour_addr":  depot_retour_addr,
             "depart_min":         depart_min,
             "return_min":         return_min,
-            # Trafic périphérique : indique si le malus a réellement été appliqué
-            "eviter_peri_actif":  (
-                eviter_peri and (
-                    (7 * 60 <= depart_min <= 9 * 60) or
-                    (17 * 60 <= depart_min <= 19 * 60)
-                )
-            ),
+            # Périphérique : nb d'arrêts intra-rocade dont les TW ont été injectées
+            "peri_affectes_nb":   len(peri_affectes),
         }
         st.success("✅ Tournée optimisée ! Consultez l'onglet **Tournée optimisée**.")
         st.rerun()
@@ -1682,12 +1703,13 @@ with tab_optim:
         c8.metric("🏁 Retour dépôt",   _fmt_min(r.get("return_min")))
 
         # Bandeau trafic périphérique
-        if r.get("eviter_peri_actif"):
+        if r.get("peri_affectes_nb", 0) > 0:
+            nb = r["peri_affectes_nb"]
             st.info(
-                "🚦 **Malus périphérique toulousain activé** — L'optimisation a appliqué "
-                "un coefficient +35 % sur les trajets passant par la rocade, "
-                "car le départ se situait en heure de pointe "
-                f"(**{_fmt_min(r.get('depart_min'))}**)."
+                f"🚦 **Mode périphérique actif** — "
+                f"**{nb} arrêt{'s' if nb > 1 else ''}** en centre-ville (intra-rocade) "
+                f"{'ont été repoussés' if nb > 1 else 'a été repoussé'} après les heures de pointe "
+                f"pour éviter les bouchons sur la rocade toulousaine."
             )
 
         # Durée totale (trajet + toutes les interventions)
