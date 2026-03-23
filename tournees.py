@@ -431,18 +431,27 @@ def osrm_trip(coords_latlon, time_windows=None, depart_min=None,
         st.error(f"OSRM table error : {data.get('code')}")
         return None
 
-    matrix = data["durations"]   # liste n x n de durees en secondes
+    matrix_real = data["durations"]   # matrice originale OSRM (durées réelles en secondes)
+                                       # conservée intacte pour le calcul des ETAs à l'affichage
 
     # Etape 2 : malus embouteillages périphérique toulousain (optionnel)
+    # On travaille sur une COPIE pour ne pas polluer les ETAs affichées.
     _ref_min = traffic_ref_min if traffic_ref_min is not None else depart_min
+    _malus_actif = False
     if eviter_peri and _ref_min is not None:
         _heure_pointe = (7 * 60 <= _ref_min <= 9 * 60) or (17 * 60 <= _ref_min <= 19 * 60)
         if _heure_pointe:
-            _MALUS_PERI = 1.35   # +35 % sur les durées des trajets via le périphérique
+            _MALUS_PERI  = 1.35   # +35 % sur les durées des trajets via le périphérique
+            _malus_actif = True
+            matrix = [row[:] for row in matrix_real]   # copie profonde de la matrice
             for _i in range(n):
                 for _j in range(n):
                     if _i != _j and _passe_par_peripherique(coords_latlon[_i], coords_latlon[_j]):
                         matrix[_i][_j] = (matrix[_i][_j] or 0) * _MALUS_PERI
+        else:
+            matrix = matrix_real   # hors pointe : pas de copie nécessaire
+    else:
+        matrix = matrix_real
 
     # Etape 3 : nearest-neighbor depuis le depot
     unvisited = list(range(1, n))
@@ -482,7 +491,9 @@ def osrm_trip(coords_latlon, time_windows=None, depart_min=None,
         "distance_km":  route["distance"] / 1000,
         "duration_min": route["duration"] / 60,
         "geometry":     geom,
-        "matrix":       matrix,
+        "matrix":       matrix,        # matrice pénalisée (utilisée pour l'optimisation)
+        "matrix_real":  matrix_real,   # matrice réelle OSRM (utilisée pour les ETAs)
+        "malus_actif":  _malus_actif,  # True si le malus périphérique a été appliqué
     }
 
 
@@ -1173,9 +1184,15 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🚦 Trafic")
+
+    def _on_peri_change():
+        """Efface le résultat précédent pour forcer une ré-optimisation."""
+        st.session_state.result = None
+
     st.session_state.eviter_peri = st.toggle(
         "Périphérique toulousain",
         value=st.session_state.eviter_peri,
+        on_change=_on_peri_change,
         help=(
             "Active un malus de +35 % sur les durées des trajets passant par "
             "le périphérique de Toulouse (rocade), si l'heure de départ se situe "
@@ -1477,7 +1494,9 @@ with tab_saisie:
         # (déjà calculée avant le spinner — on conserve la variable telle quelle)
 
         # Calcul automatique de l'heure de départ optimale (purement mathématique)
-        depart_min_opt = _compute_optimal_departure(trip["order"], trip["matrix"], time_windows)
+        # On utilise matrix_real (durées OSRM non pénalisées) pour que les seuils
+        # de départ soient basés sur les temps de trajet réels.
+        depart_min_opt = _compute_optimal_departure(trip["order"], trip["matrix_real"], time_windows)
 
         if depart_min_opt is not None:
             depart_min_raw = depart_min_opt   # résultat pur sans contrainte légale
@@ -1509,20 +1528,28 @@ with tab_saisie:
                 f"(heure légale minimale configurée)."
             )
 
-        # Seconde passe 2-opt avec l'heure de départ calculée (affine si TW présentes)
+        # Seconde passe 2-opt avec l'heure de départ calculée.
+        # Déclenchée si des contraintes horaires existent OU si le malus
+        # périphérique est activé (pour affiner l'ordre avec la vraie heure de pointe).
         has_tw = any(
             tw.get("earliest") is not None or tw.get("latest") is not None
             for tw in time_windows[1:]
         )
-        if has_tw:
-            with st.spinner("⚙️ Affinage de l'ordre selon les contraintes horaires…"):
+        if has_tw or eviter_peri:
+            _spinner_msg = (
+                "⚙️ Affinage de l'ordre selon les contraintes horaires…"
+                if has_tw
+                else "🚦 Affinage de l'itinéraire avec prise en compte du périphérique…"
+            )
+            with st.spinner(_spinner_msg):
                 trip2 = osrm_trip(coords_list, time_windows=time_windows, depart_min=depart_min,
                                   eviter_peri=eviter_peri, traffic_ref_min=depart_min)
                 if trip2:
                     trip = trip2
 
-        # Heures d'arrivée réelles
-        arrivals = _compute_arrivals(trip["order"], trip["matrix"], depart_min, time_windows)
+        # Heures d'arrivée réelles — on utilise matrix_real (sans malus) pour des
+        # ETAs fidèles à la réalité ; la matrice pénalisée n'a servi qu'à l'optimisation.
+        arrivals = _compute_arrivals(trip["order"], trip["matrix_real"], depart_min, time_windows)
 
         order         = trip["order"]
         stops_ordered = []
