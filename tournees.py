@@ -107,6 +107,38 @@ ACTION_CONSIGNES = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DURÉES AUTOMATIQUES PAR ACTION (WC chimique uniquement, × quantité)
+# ─────────────────────────────────────────────────────────────────────────────
+
+WC_DUREES_PAR_ACTION = {
+    "Déposer":       15,   # minutes par WC chimique
+    "Retirer":       20,
+    "Nettoyer":      10,
+    "Chargement":    15,
+    "Déchargement":   5,
+}
+
+PAUSE_DEJEUNER_MIN = 30  # pause méridienne ajoutée une fois par tournée
+
+
+def _auto_duree(action: str, produit: str, quantite) -> int | None:
+    """
+    Retourne la durée automatique (en minutes) pour un arrêt WC chimique,
+    ou None si le produit n'est pas un WC chimique.
+    """
+    if str(produit).strip() != "WC chimique":
+        return None
+    base = WC_DUREES_PAR_ACTION.get(str(action).strip())
+    if base is None:
+        return None
+    try:
+        qty = max(1, int(float(quantite) or 1))
+    except (ValueError, TypeError):
+        qty = 1
+    return base * qty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CONFIG PAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1455,6 +1487,50 @@ with tab_saisie:
                 del st.session_state["editor_stops"]
             st.rerun()
 
+    # ── Bouton précalcul automatique des durées ──
+    st.markdown("---")
+    col_auto, col_info = st.columns([2, 3])
+    with col_auto:
+        if st.button("⏱️ Précalculer les durées (WC chimiques)",
+                     use_container_width=True,
+                     help=(
+                         "Remplit automatiquement la colonne **Durée (min)** "
+                         "pour les arrêts de type **WC chimique** selon les barèmes :\n\n"
+                         "• Nettoyer : 10 min/WC\n"
+                         "• Déposer : 15 min/WC\n"
+                         "• Retirer : 20 min/WC\n"
+                         "• Chargement : 15 min/WC\n"
+                         "• Déchargement : 5 min/WC\n\n"
+                         "La durée est multipliée par la quantité. "
+                         "Les autres produits ne sont pas modifiés. "
+                         "Vous pouvez ensuite ajuster manuellement."
+                     )):
+            _flush_editor()
+            df_tmp = st.session_state.df_stops.copy()
+            nb_maj = 0
+            for idx, row in df_tmp.iterrows():
+                duree_auto = _auto_duree(
+                    row.get("Action", ""),
+                    row.get("Produit", ""),
+                    row.get("Quantité", 1),
+                )
+                if duree_auto is not None:
+                    df_tmp.at[idx, "Durée (min)"] = duree_auto
+                    nb_maj += 1
+            st.session_state.df_stops = df_tmp
+            if "editor_stops" in st.session_state:
+                del st.session_state["editor_stops"]
+            if nb_maj > 0:
+                st.success(f"✅ Durées précalculées pour **{nb_maj}** arrêt(s) WC chimique.")
+            else:
+                st.info("ℹ️ Aucun arrêt WC chimique trouvé à mettre à jour.")
+            st.rerun()
+    with col_info:
+        st.caption(
+            "💡 Les durées WC chimique sont calculées automatiquement (× quantité). "
+            "La colonne **Durée (min)** reste modifiable manuellement après précalcul."
+        )
+
     st.markdown("---")
     leg_cols = st.columns(3)
     for col, (action, color) in zip(leg_cols, ACTION_COLORS.items()):
@@ -1738,7 +1814,7 @@ with tab_saisie:
             arr_idx += 1
 
         dist_km   = trip["distance_km"]
-        dur_min   = trip["duration_min"]
+        dur_min   = trip["duration_min"] + PAUSE_DEJEUNER_MIN  # +30 min pause déjeuner
         fuel_l    = dist_km * fuel_conso / 100
         fuel_cost = fuel_l * fuel_price
         km_saved  = max(0, (orig["distance_km"]  - dist_km))  if orig else 0
@@ -1773,7 +1849,7 @@ with tab_saisie:
             else:
                 travel_back = 0
             last_dep = stops_ordered[-1]["departure_min"] or stops_ordered[-1]["arrival_min"] or depart_min
-            return_min = last_dep + travel_back
+            return_min = last_dep + travel_back + PAUSE_DEJEUNER_MIN  # pause déjeuner incluse
         else:
             return_min = depart_min
 
@@ -1869,10 +1945,11 @@ with tab_optim:
             m_tot = int(total_tour_min % 60)
             interv_total = sum(s.get("duration_min", 0) for s in display_r["stops_ordered"])
             st.info(
-                f"🗓️ **Durée totale de la tournée** (trajet + interventions) : "
+                f"🗓️ **Durée totale de la tournée** (trajet + interventions + pause) : "
                 f"**{h_tot}h{m_tot:02d}** "
-                f"— dont {int(display_r['duration_min'])} min de trajet "
-                f"et {interv_total} min d'interventions"
+                f"— dont {int(display_r['duration_min'])} min de trajet, "
+                f"{interv_total} min d'interventions "
+                f"et **{PAUSE_DEJEUNER_MIN} min de pause déjeuner** 🍽️"
             )
 
         st.markdown("---")
