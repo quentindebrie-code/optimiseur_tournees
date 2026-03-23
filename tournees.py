@@ -1929,7 +1929,7 @@ with tab_optim:
                     disp_stop = (display_r["stops_ordered"][pos]
                                  if pos < len(display_r["stops_ordered"]) else s)
                     arr_str      = _fmt_min(disp_stop.get("arrival_min")) or ""
-                    client_short = (s["client"] or "")[:22]
+                    client_short = str(s.get("client") or "").strip()[:22]
                     addr_short   = s["address"][:28]
                     display_name = client_short if client_short else addr_short
                     arr_part     = f" · {arr_str}" if arr_str else ""
