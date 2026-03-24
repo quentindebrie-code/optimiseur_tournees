@@ -118,17 +118,38 @@ WC_DUREES_PAR_ACTION = {
     "Déchargement":   5,
 }
 
+# Barème WC handicapé (options ignorées, durée × quantité)
+WC_HANDICAPE_DUREES_PAR_ACTION = {
+    "Nettoyer":      20,
+    "Déposer":       30,
+    "Retirer":       40,
+    "Chargement":    30,
+    "Déchargement":  10,
+}
+
 PAUSE_DEJEUNER_MIN = 30  # pause méridienne ajoutée une fois par tournée
 
 
 def _auto_duree(action: str, produit: str, quantite) -> int | None:
     """
-    Retourne la durée automatique (en minutes) pour un arrêt WC chimique,
-    ou None si le produit n'est pas un WC chimique.
+    Retourne la durée automatique (en minutes) pour un arrêt WC chimique
+    ou WC handicapé, ou None si le produit ne correspond à aucun des deux.
+
+    - WC chimique  : barème WC_DUREES_PAR_ACTION         × quantité
+    - WC handicapé : barème WC_HANDICAPE_DUREES_PAR_ACTION × quantité
+                     (les options sont ignorées)
     """
-    if str(produit).strip() != "WC chimique":
+    produit_norm = str(produit).strip()
+    action_norm  = str(action).strip()
+
+    if produit_norm == "WC chimique":
+        bareme = WC_DUREES_PAR_ACTION
+    elif produit_norm == "WC handicapé":
+        bareme = WC_HANDICAPE_DUREES_PAR_ACTION
+    else:
         return None
-    base = WC_DUREES_PAR_ACTION.get(str(action).strip())
+
+    base = bareme.get(action_norm)
     if base is None:
         return None
     try:
@@ -1491,23 +1512,32 @@ with tab_saisie:
     st.markdown("---")
     col_auto, col_info = st.columns([2, 3])
     with col_auto:
-        if st.button("⏱️ Précalculer les durées (WC chimiques)",
+        if st.button("⏱️ Précalculer les durées (WC chimiques & handicapés)",
                      use_container_width=True,
                      help=(
                          "Remplit automatiquement la colonne **Durée (min)** "
-                         "pour les arrêts de type **WC chimique** selon les barèmes :\n\n"
+                         "pour les arrêts **WC chimique** et **WC handicapé** "
+                         "selon les barèmes ci-dessous (durée × quantité) :\n\n"
+                         "**WC chimique**\n"
                          "• Nettoyer : 10 min/WC\n"
                          "• Déposer : 15 min/WC\n"
                          "• Retirer : 20 min/WC\n"
                          "• Chargement : 15 min/WC\n"
                          "• Déchargement : 5 min/WC\n\n"
-                         "La durée est multipliée par la quantité. "
+                         "**WC handicapé** (options ignorées)\n"
+                         "• Nettoyer : 20 min/WC\n"
+                         "• Déposer : 30 min/WC\n"
+                         "• Retirer : 40 min/WC\n"
+                         "• Chargement : 30 min/WC\n"
+                         "• Déchargement : 10 min/WC\n\n"
                          "Les autres produits ne sont pas modifiés. "
                          "Vous pouvez ensuite ajuster manuellement."
                      )):
             _flush_editor()
             df_tmp = st.session_state.df_stops.copy()
             nb_maj = 0
+            nb_wcc = 0   # WC chimique mis à jour
+            nb_wch = 0   # WC handicapé mis à jour
             for idx, row in df_tmp.iterrows():
                 duree_auto = _auto_duree(
                     row.get("Action", ""),
@@ -1517,17 +1547,27 @@ with tab_saisie:
                 if duree_auto is not None:
                     df_tmp.at[idx, "Durée (min)"] = duree_auto
                     nb_maj += 1
+                    if str(row.get("Produit", "")).strip() == "WC handicapé":
+                        nb_wch += 1
+                    else:
+                        nb_wcc += 1
             st.session_state.df_stops = df_tmp
             if "editor_stops" in st.session_state:
                 del st.session_state["editor_stops"]
             if nb_maj > 0:
-                st.success(f"✅ Durées précalculées pour **{nb_maj}** arrêt(s) WC chimique.")
+                details = []
+                if nb_wcc > 0:
+                    details.append(f"**{nb_wcc}** WC chimique")
+                if nb_wch > 0:
+                    details.append(f"**{nb_wch}** WC handicapé")
+                st.success(f"✅ Durées précalculées pour {' et '.join(details)}.")
             else:
-                st.info("ℹ️ Aucun arrêt WC chimique trouvé à mettre à jour.")
+                st.info("ℹ️ Aucun arrêt WC chimique ou WC handicapé trouvé à mettre à jour.")
             st.rerun()
     with col_info:
         st.caption(
-            "💡 Les durées WC chimique sont calculées automatiquement (× quantité). "
+            "💡 Les durées sont calculées automatiquement (× quantité) "
+            "pour les WC chimiques et les WC handicapés. "
             "La colonne **Durée (min)** reste modifiable manuellement après précalcul."
         )
 
