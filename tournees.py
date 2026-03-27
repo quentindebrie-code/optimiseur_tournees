@@ -391,17 +391,24 @@ def _qty_label(row):
         label += f" + {qty} × {option}"
     return label
 
-def _compute_arrivals(tour, matrix, depart_min, time_windows):
+def _compute_arrivals(tour, matrix, depart_min, time_windows, pause_after_idx=None):
     """
     Calcule l'heure d'arrivée réelle à chaque arrêt (en minutes depuis minuit),
     en tenant compte des fenêtres temporelles et des durées d'intervention.
     time_windows[i] contient aussi "duration" (durée intervention en minutes).
+
+    pause_after_idx : indice 0-based dans la liste des arrêts (hors dépôt) après
+    lequel injecter la pause déjeuner (PAUSE_DEJEUNER_MIN). Quand ce paramètre est
+    fourni, tous les arrêts situés APRÈS la pause voient leur heure décalée d'autant,
+    ce qui garantit la cohérence complète du planning.
+
     Retourne une liste de dicts par arrêt (hors dépôt) :
       arrival_min, wait_min, departure_min, tw_early, tw_late, violated, duration_min
     """
     results      = []
     current_time = depart_min   # minutes depuis minuit
     current_idx  = tour[0]      # = 0 (dépôt)
+    stop_count   = 0            # indice 0-based de l'arrêt courant dans results
 
     for step, next_idx in enumerate(tour[1:], 1):
         travel_min    = (matrix[current_idx][next_idx] or 0) / 60
@@ -432,7 +439,15 @@ def _compute_arrivals(tour, matrix, depart_min, time_windows):
             "violated":      violated,
             "duration_min":  duration_min,
         })
+
         current_time = departure_min   # on repart après l'intervention
+
+        # ── Pause déjeuner : on l'injecte APRÈS l'arrêt indiqué ──
+        # Le chauffeur ne repart vers l'arrêt suivant qu'après la fin de la pause.
+        if pause_after_idx is not None and stop_count == pause_after_idx:
+            current_time += PAUSE_DEJEUNER_MIN
+
+        stop_count  += 1
         current_idx  = next_idx
 
     return results
@@ -701,7 +716,14 @@ def _recalc_manual_route(result, new_order):
     ]
 
     # ── ETAs ──
-    arrivals = _compute_arrivals(list(range(n + 1)), sub_matrix, depart_min, tw_new)
+    # Passe 1 : sans pause → localise le passage de midi
+    arrivals_prelim = _compute_arrivals(list(range(n + 1)), sub_matrix, depart_min, tw_new)
+    pause_idx_manual = _find_pause_position(
+        [{"departure_min": a.get("departure_min")} for a in arrivals_prelim])
+    # Passe 2 : avec pause injectée → ETAs cohérentes après la pause
+    arrivals = _compute_arrivals(
+        list(range(n + 1)), sub_matrix, depart_min, tw_new,
+        pause_after_idx=pause_idx_manual)
 
     new_stops = []
     for rank, (orig_idx, arr) in enumerate(zip(new_order, arrivals), 1):
@@ -753,7 +775,11 @@ def _recalc_manual_route(result, new_order):
                        or depart_min)
         last_mi     = new_order[-1] + 1   # indice dans stop_matrix
         travel_back = (stop_matrix[last_mi][0] or 0) / 60
-        return_min  = last_dep + travel_back
+        # Pause déjà balisée dans last_dep si elle précède le dernier arrêt
+        if pause_idx_manual >= len(new_stops) - 1:
+            return_min = last_dep + PAUSE_DEJEUNER_MIN + travel_back
+        else:
+            return_min = last_dep + travel_back
     else:
         return_min = depart_min
 
@@ -1465,7 +1491,7 @@ with st.sidebar:
     st.subheader("🚛 Véhicule")
     fuel_conso = st.number_input(
         "Consommation (L/100 km)", min_value=5.0, max_value=30.0,
-        value=12.20, step=0.5,
+        value=15.0, step=0.5,
         help="Petit camion avec remorque : environ 14–16 L/100 km")
     fuel_price = st.number_input(
         "Prix carburant (€/L)", min_value=1.0, max_value=3.5,
@@ -1971,7 +1997,15 @@ with tab_saisie:
 
         # Heures d'arrivée réelles — on utilise matrix_real (sans malus) pour des
         # ETAs fidèles à la réalité ; la matrice pénalisée n'a servi qu'à l'optimisation.
-        arrivals = _compute_arrivals(trip["order"], trip["matrix_real"], depart_min, time_windows)
+        # Passe 1 : sans pause → localise le passage de midi
+        arrivals_prelim = _compute_arrivals(
+            trip["order"], trip["matrix_real"], depart_min, time_windows)
+        pause_idx = _find_pause_position(
+            [{"departure_min": a.get("departure_min")} for a in arrivals_prelim])
+        # Passe 2 : avec pause injectée → toutes les ETAs après la pause sont correctes
+        arrivals = _compute_arrivals(
+            trip["order"], trip["matrix_real"], depart_min, time_windows,
+            pause_after_idx=pause_idx)
 
         order         = trip["order"]
         stops_ordered = []
@@ -2049,7 +2083,12 @@ with tab_saisie:
             else:
                 travel_back = 0
             last_dep = stops_ordered[-1]["departure_min"] or stops_ordered[-1]["arrival_min"] or depart_min
-            return_min = last_dep + travel_back + PAUSE_DEJEUNER_MIN  # pause déjeuner incluse
+            # La pause est déjà dans last_dep si elle précède le dernier arrêt ;
+            # sinon (pause après le dernier arrêt) on l'ajoute ici.
+            if pause_idx >= len(stops_ordered) - 1:
+                return_min = last_dep + travel_back + PAUSE_DEJEUNER_MIN
+            else:
+                return_min = last_dep + travel_back
         else:
             return_min = depart_min
 
