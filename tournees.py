@@ -691,7 +691,7 @@ def _recalc_manual_route(result, new_order):
     depart_min         = result["depart_min"]
     depot_coords       = result["depot_coords"]
     depot_retour_coords = result.get("depot_retour_coords") or result["depot_coords"]
-    fuel_conso         = result.get("fuel_conso", 15.0)
+    fuel_conso         = result.get("fuel_conso", 12,20)
     fuel_price_val     = result.get("fuel_price",  1.85)
 
     n = len(new_order)
