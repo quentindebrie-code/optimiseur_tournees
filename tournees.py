@@ -303,6 +303,71 @@ def _compute_optimal_departure(tour, matrix, time_windows):
     return max(0, int(optimal))
 
 
+import re as _re
+
+def _parse_addr_ville_rue(address: str):
+    """
+    Extrait (ville, rue) depuis une adresse française.
+    Format typique : "Numéro Rue, CP Ville" ou "Rue, CP Ville".
+    Retourne (ville, rue) sous forme de chaînes.
+    """
+    addr = str(address).strip()
+    # Chercher le code postal (5 chiffres)
+    m = _re.search(r'\b(\d{5})\s+(.+?)(?:,|$)', addr)
+    if m:
+        ville = m.group(2).strip().rstrip(',').strip()
+        rue   = addr[:m.start()].strip().rstrip(',').strip()
+    else:
+        parts = [p.strip() for p in addr.split(',')]
+        ville = parts[-1] if parts else addr
+        rue   = ', '.join(parts[:-1]) if len(parts) > 1 else ''
+    return ville, rue
+
+
+def _sortable_label(s: dict, pos: int, disp_stop: dict) -> str:
+    """
+    Construit le label affiché dans le drag-and-drop 'Ordre des arrêts'.
+    Format : [orig_idx] Ville · Rue · Client · HH:MM (⚠️)
+    """
+    orig_idx = pos   # passé explicitement par l'appelant
+    ville, rue       = _parse_addr_ville_rue(s.get("address", ""))
+    client           = str(s.get("client") or "").strip()
+    arr_str          = _fmt_min(disp_stop.get("arrival_min")) or ""
+    violated_flag    = " ⚠️" if disp_stop.get("violated") else ""
+    arr_part         = f" · {arr_str}" if arr_str else ""
+    # Assemblage Ville + Rue + Client (on exclut les parties vides)
+    name_parts = [p for p in [ville[:28], rue[:28], client[:22]] if p]
+    display_name = " · ".join(name_parts) if name_parts else s.get("address", "")[:40]
+    return f"[{orig_idx}] {display_name}{arr_part}{violated_flag}"
+
+
+def _find_pause_position(stops_ordered: list) -> int:
+    """
+    Retourne l'indice (0-based) de l'arrêt APRÈS lequel placer la pause déjeuner.
+    Heuristique : premier arrêt dont le départ estimé dépasse 12h00 (720 min).
+    Si tous les arrêts précèdent midi, on insère au milieu de la tournée.
+    """
+    NOON = 720  # 12:00
+    for i, s in enumerate(stops_ordered):
+        dep = s.get("departure_min")
+        if dep is not None and dep >= NOON:
+            return max(0, i)       # juste avant cet arrêt (après le précédent)
+    return max(0, len(stops_ordered) // 2)
+
+
+def _pause_slot(stops_ordered: list, pause_idx: int) -> tuple[str, str]:
+    """
+    Retourne (heure_debut, heure_fin) de la pause déjeuner au format HH:MM.
+    La pause commence au départ du stop[pause_idx].
+    """
+    s = stops_ordered[pause_idx] if 0 <= pause_idx < len(stops_ordered) else {}
+    start = s.get("departure_min") or s.get("arrival_min")
+    if start is None:
+        return ("", "")
+    end = start + PAUSE_DEJEUNER_MIN
+    return (_fmt_min(start), _fmt_min(end))
+
+
 def _qty_label(row):
     """
     Construit la description lisible de la commande à partir des colonnes
@@ -930,7 +995,11 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         c.alignment = center; c.border = brd
     ws.row_dimensions[hr].height = 20
 
-    for stop in result["stops_ordered"]:
+    pause_fill = PatternFill("solid", fgColor="FFF9C4")
+    pause_font = Font(bold=True, color="795548")
+    pause_idx  = _find_pause_position(result["stops_ordered"])
+
+    for si, stop in enumerate(result["stops_ordered"]):
         ws.append([stop["order_num"], stop["action"],
                    stop.get("produit", ""), stop.get("option", ""),
                    stop.get("qty_num", ""),
@@ -952,6 +1021,25 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         ws.cell(r, 2).fill = action_fills.get(stop["action"],
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
+
+        # ── Ligne pause déjeuner (après stop[pause_idx]) ──
+        if si == pause_idx:
+            _ps, _pe = _pause_slot(result["stops_ordered"], pause_idx)
+            slot_txt = f"{_ps} – {_pe}" if _ps else f"{PAUSE_DEJEUNER_MIN} min"
+            ws.append(["", f"🍽️ PAUSE DÉJEUNER — {PAUSE_DEJEUNER_MIN} min",
+                        "", "", "", "", "",
+                        PAUSE_DEJEUNER_MIN,
+                        "", "", _ps, _pe,
+                        f"Créneau : {slot_txt}", ""])
+            pr = ws.max_row
+            ws.merge_cells(f"B{pr}:G{pr}")
+            for col in range(1, 15):
+                c = ws.cell(pr, col)
+                c.fill   = pause_fill
+                c.font   = pause_font
+                c.border = brd
+                c.alignment = center if col not in (13,) else left
+            ws.row_dimensions[pr].height = 18
 
     ws.append(["↩", "Retour dépôt", "", "", "", "", result.get("depot_retour_addr",""), "", "", "", "", "", "", ""])
     r = ws.max_row
@@ -1076,6 +1164,8 @@ def export_pdf(result, tour_date, driver_name):
     ])
     row_styles += [("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#FFF3CD"))]
 
+    pdf_pause_idx = _find_pause_position(result["stops_ordered"])
+
     for i, stop in enumerate(result["stops_ordered"]):
         arr_str = _fmt_min(stop.get("arrival_min")) or ""
         arr_para_style = cell_style
@@ -1103,9 +1193,35 @@ def export_pdf(result, tour_date, driver_name):
             P(_fmt_min(stop.get("departure_min")) or ""),
             P(stop.get("observations", "") or ""),
         ])
-        ri = i + 2
+        ri = len(table_data) - 1
         bg = action_bg.get(stop["action"], colors.HexColor("#F0F0F0"))
         row_styles.append(("BACKGROUND", (1, ri), (1, ri), bg))
+
+        # ── Ligne pause déjeuner (insérée après pdf_pause_idx) ──
+        if i == pdf_pause_idx:
+            _ps, _pe = _pause_slot(result["stops_ordered"], pdf_pause_idx)
+            slot_txt = f"{_ps} – {_pe}" if _ps else f"{PAUSE_DEJEUNER_MIN} min"
+            pause_style = ParagraphStyle("pause_lbl", parent=styles["Normal"],
+                                          fontSize=8, leading=10,
+                                          fontName="Helvetica-Bold",
+                                          textColor=colors.HexColor("#795548"))
+            table_data.append([
+                P(""),
+                P(f"🍽️ Pause déjeuner", pause_style),
+                P(""), P(""), P(""), P(""), P(""),
+                P(str(PAUSE_DEJEUNER_MIN), pause_style),
+                P(""), P(""),
+                P(_ps, pause_style),
+                P(_pe, pause_style),
+                P(f"Créneau : {slot_txt}", pause_style),
+            ])
+            pi = len(table_data) - 1
+            row_styles.append(("BACKGROUND", (0, pi), (-1, pi),
+                                colors.HexColor("#FFF9C4")))
+            row_styles.append(("LINEABOVE",  (0, pi), (-1, pi),
+                                1, colors.HexColor("#F9A825")))
+            row_styles.append(("LINEBELOW",  (0, pi), (-1, pi),
+                                1, colors.HexColor("#F9A825")))
 
     # Ligne dépôt retour
     table_data.append([
@@ -1507,6 +1623,50 @@ with tab_saisie:
             if "editor_stops" in st.session_state:
                 del st.session_state["editor_stops"]
             st.rerun()
+
+    # ── Suppression de lignes sélectionnées ──
+    if len(st.session_state.df_stops) > 1:
+        df_preview = st.session_state.df_stops.copy()
+        # Génère un libellé lisible par ligne (avant flush, pour la preview)
+        key_state = st.session_state.get("editor_stops", {})
+        for row_idx, cols in (key_state.get("edited_rows") or {}).items():
+            for col, val in cols.items():
+                df_preview.at[int(row_idx), col] = val
+        row_labels = {}
+        for i, row in df_preview.iterrows():
+            addr_short = str(row.get("Adresse") or "").strip()[:40] or "(sans adresse)"
+            client_short = str(row.get("Nom du client") or "").strip()
+            suffix = f" · {client_short}" if client_short else ""
+            row_labels[i] = f"Ligne {i + 1} — {row.get('Action','?')} · {addr_short}{suffix}"
+        sel_col, btn_col2 = st.columns([4, 1])
+        with sel_col:
+            selected_idxs = st.multiselect(
+                "Sélectionner des lignes à supprimer :",
+                options=list(row_labels.keys()),
+                format_func=lambda i: row_labels[i],
+                key="rows_to_delete",
+                label_visibility="collapsed",
+                placeholder="Sélectionner des lignes à supprimer…",
+            )
+        with btn_col2:
+            if st.button("🗑️ Supprimer la sélection",
+                         use_container_width=True,
+                         disabled=not selected_idxs,
+                         help="Supprime les lignes sélectionnées (au moins une ligne sera conservée)"):
+                _flush_editor()
+                # On ne supprime pas si ça laisserait 0 ligne
+                remaining = [i for i in st.session_state.df_stops.index
+                             if i not in selected_idxs]
+                if len(remaining) == 0:
+                    st.warning("⚠️ Impossible de supprimer toutes les lignes.")
+                else:
+                    st.session_state.df_stops = (
+                        st.session_state.df_stops.loc[remaining]
+                        .reset_index(drop=True)
+                    )
+                if "editor_stops" in st.session_state:
+                    del st.session_state["editor_stops"]
+                st.rerun()
 
     # ── Bouton précalcul automatique des durées ──
     st.markdown("---")
@@ -2042,18 +2202,9 @@ with tab_optim:
                 item_labels = []
                 for pos, orig_idx in enumerate(cur_order):
                     s = base_stops[orig_idx]
-                    # Heure d'arrivée depuis le résultat actif
                     disp_stop = (display_r["stops_ordered"][pos]
                                  if pos < len(display_r["stops_ordered"]) else s)
-                    arr_str      = _fmt_min(disp_stop.get("arrival_min")) or ""
-                    client_short = str(s.get("client") or "").strip()[:22]
-                    addr_short   = s["address"][:28]
-                    display_name = client_short if client_short else addr_short
-                    arr_part     = f" · {arr_str}" if arr_str else ""
-                    violated_flag = " ⚠️" if disp_stop.get("violated") else ""
-                    item_labels.append(
-                        f"[{orig_idx}] {s['action']} · {display_name}{arr_part}{violated_flag}"
-                    )
+                    item_labels.append(_sortable_label(s, orig_idx, disp_stop))
 
                 sorted_labels = _sortables_sort_items(
                     item_labels, key="manual_tour_sort"
@@ -2082,7 +2233,12 @@ with tab_optim:
                 unsafe_allow_html=True,
             )
 
-            for stop in display_r["stops_ordered"]:
+            _stops_display = display_r["stops_ordered"]
+            _pause_idx     = _find_pause_position(_stops_display)
+            _pause_shown   = False
+
+            for _si, stop in enumerate(_stops_display):
+                # ── Carte de l'arrêt ──
                 bg  = ACTION_COLORS.get(stop["action"], "#f0f0f0")
                 brd = ACTION_BORDER_COLORS.get(stop["action"], "#999")
                 cli = f" · {stop['client']}" if stop['client'] else ""
@@ -2118,6 +2274,19 @@ with tab_optim:
                     f'{tw_html}{arr_html}</div>',
                     unsafe_allow_html=True,
                 )
+                # ── Carte pause déjeuner (insérée après _pause_idx) ──
+                if not _pause_shown and _si == _pause_idx:
+                    _ps, _pe = _pause_slot(_stops_display, _pause_idx)
+                    _slot_txt = f"{_ps} – {_pe}" if _ps else f"{PAUSE_DEJEUNER_MIN} min"
+                    st.markdown(
+                        f'<div class="stop-card" style="background:#FFF9C4;'
+                        f'border-left:4px solid #F9A825;">'
+                        f'<b>🍽️ Pause déjeuner — {PAUSE_DEJEUNER_MIN} min</b><br>'
+                        f'<small style="color:#795548">🕐 Créneau : <b>{_slot_txt}</b></small>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    _pause_shown = True
 
             retour_str  = _fmt_min(display_r.get("return_min"))
             retour_html = (f"<br><small style='color:#1f4e79;font-weight:600'>"
