@@ -1465,7 +1465,7 @@ with st.sidebar:
     st.subheader("🚛 Véhicule")
     fuel_conso = st.number_input(
         "Consommation (L/100 km)", min_value=5.0, max_value=30.0,
-        value=15.0, step=0.5,
+        value=12.20, step=0.5,
         help="Petit camion avec remorque : environ 14–16 L/100 km")
     fuel_price = st.number_input(
         "Prix carburant (€/L)", min_value=1.0, max_value=3.5,
