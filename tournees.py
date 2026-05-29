@@ -691,7 +691,7 @@ def _recalc_manual_route(result, new_order):
     depart_min         = result["depart_min"]
     depot_coords       = result["depot_coords"]
     depot_retour_coords = result.get("depot_retour_coords") or result["depot_coords"]
-    fuel_conso         = result.get("fuel_conso", 12,20)
+    fuel_conso         = result.get("fuel_conso", 12.20)
     fuel_price_val     = result.get("fuel_price",  1.85)
 
     n = len(new_order)
@@ -806,7 +806,7 @@ def build_map(depot_coords, stops_ordered, geometry, depot_depart_addr="Dépôt 
     if geometry:
         folium.PolyLine(geometry, color="#1f4e79", weight=4, opacity=0.85).add_to(m)
     folium.Marker(depot_coords,
-                  popup=folium.Popup(f"<b>Dépôt départ</b><br>{r["depot_depart_addr"] if "r" in dir() else ""}", max_width=260),
+                  popup=folium.Popup(f"<b>Dépôt départ</b><br>{depot_depart_addr}", max_width=260),
                   tooltip="Dépôt – Départ",
                   icon=folium.Icon(color="orange", icon="home", prefix="fa")).add_to(m)
     # Marqueur retour dépôt si différent du départ
