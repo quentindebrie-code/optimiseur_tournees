@@ -201,6 +201,7 @@ if "driver"            not in st.session_state: st.session_state.driver         
 if "depot_depart_key" not in st.session_state: st.session_state.depot_depart_key = DEPOT_DEPART_DEFAULT
 if "depot_retour_key" not in st.session_state: st.session_state.depot_retour_key = DEPOT_RETOUR_DEFAULT
 if "eviter_peri"       not in st.session_state: st.session_state.eviter_peri       = False
+if "pause_dejeuner"    not in st.session_state: st.session_state.pause_dejeuner    = True
 if "manual_order"      not in st.session_state: st.session_state.manual_order      = None
 if "manual_result"     not in st.session_state: st.session_state.manual_result     = None
 
@@ -401,6 +402,7 @@ def _compute_arrivals(tour, matrix, depart_min, time_windows, pause_after_idx=No
     lequel injecter la pause déjeuner (PAUSE_DEJEUNER_MIN). Quand ce paramètre est
     fourni, tous les arrêts situés APRÈS la pause voient leur heure décalée d'autant,
     ce qui garantit la cohérence complète du planning.
+    Si pause_after_idx vaut None, aucune pause n'est injectée.
 
     Retourne une liste de dicts par arrêt (hors dépôt) :
       arrival_min, wait_min, departure_min, tw_early, tw_late, violated, duration_min
@@ -693,6 +695,7 @@ def _recalc_manual_route(result, new_order):
     depot_retour_coords = result.get("depot_retour_coords") or result["depot_coords"]
     fuel_conso         = result.get("fuel_conso", 12.20)
     fuel_price_val     = result.get("fuel_price",  1.85)
+    pause_enabled      = result.get("pause_dejeuner", True)
 
     n = len(new_order)
 
@@ -720,10 +723,10 @@ def _recalc_manual_route(result, new_order):
     arrivals_prelim = _compute_arrivals(list(range(n + 1)), sub_matrix, depart_min, tw_new)
     pause_idx_manual = _find_pause_position(
         [{"departure_min": a.get("departure_min")} for a in arrivals_prelim])
-    # Passe 2 : avec pause injectée → ETAs cohérentes après la pause
+    # Passe 2 : avec pause injectée (si activée) → ETAs cohérentes après la pause
     arrivals = _compute_arrivals(
         list(range(n + 1)), sub_matrix, depart_min, tw_new,
-        pause_after_idx=pause_idx_manual)
+        pause_after_idx=(pause_idx_manual if pause_enabled else None))
 
     new_stops = []
     for rank, (orig_idx, arr) in enumerate(zip(new_order, arrivals), 1):
@@ -760,7 +763,8 @@ def _recalc_manual_route(result, new_order):
             if rdata.get("code") == "Ok":
                 route   = rdata["routes"][0]
                 dist_km = route["distance"] / 1000
-                dur_min = route["duration"] / 60
+                # durée trajet pur + pause éventuelle (cohérent avec l'optimisation)
+                dur_min = route["duration"] / 60 + (PAUSE_DEJEUNER_MIN if pause_enabled else 0)
                 geometry = [[lat, lon] for lon, lat in route["geometry"]["coordinates"]]
         except Exception:
             pass  # conserve geometry/dist/dur du résultat précédent
@@ -776,7 +780,7 @@ def _recalc_manual_route(result, new_order):
         last_mi     = new_order[-1] + 1   # indice dans stop_matrix
         travel_back = (stop_matrix[last_mi][0] or 0) / 60
         # Pause déjà balisée dans last_dep si elle précède le dernier arrêt
-        if pause_idx_manual >= len(new_stops) - 1:
+        if pause_enabled and pause_idx_manual >= len(new_stops) - 1:
             return_min = last_dep + PAUSE_DEJEUNER_MIN + travel_back
         else:
             return_min = last_dep + travel_back
@@ -969,6 +973,7 @@ def generate_map_image(depot_coords, stops_ordered, geometry, depot_retour_coord
 # ─────────────────────────────────────────────────────────────────────────────
 
 def export_excel(result, tour_date, driver_name, fuel_price_per_l):
+    pause_enabled = result.get("pause_dejeuner", True)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Feuille de tournée"
@@ -1002,6 +1007,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         ("Distance totale",     f"{result['distance_km']:.1f} km"),
         ("Durée estimée",       f"{int(result['duration_min']//60)}h{int(result['duration_min']%60):02d}"),
         ("Carburant estimé",    f"{result['fuel_liters']:.1f} L  ({result['fuel_cost']:.2f} €)"),
+        ("Pause déjeuner",      f"{PAUSE_DEJEUNER_MIN} min incluse" if pause_enabled else "Non comptée"),
         ("Gain optimisation",   f"{result['km_saved']:.1f} km – {int(result['time_saved_min'])} min"),
     ]:
         r = ws.max_row + 1
@@ -1048,8 +1054,8 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
 
-        # ── Ligne pause déjeuner (après stop[pause_idx]) ──
-        if si == pause_idx:
+        # ── Ligne pause déjeuner (après stop[pause_idx]) — seulement si activée ──
+        if pause_enabled and si == pause_idx:
             _ps, _pe = _pause_slot(result["stops_ordered"], pause_idx)
             slot_txt = f"{_ps} – {_pe}" if _ps else f"{PAUSE_DEJEUNER_MIN} min"
             ws.append(["", f"🍽️ PAUSE DÉJEUNER — {PAUSE_DEJEUNER_MIN} min",
@@ -1088,6 +1094,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def export_pdf(result, tour_date, driver_name):
+    pause_enabled = result.get("pause_dejeuner", True)
     buf    = BytesIO()
     doc    = SimpleDocTemplate(buf, pagesize=A4,
                                leftMargin=8*mm, rightMargin=8*mm,
@@ -1139,6 +1146,8 @@ def export_pdf(result, tour_date, driver_name):
          f"{int(result['duration_min']//60)}h{int(result['duration_min']%60):02d}"],
         ["Carburant estimé :",
          f"{result['fuel_liters']:.1f} L  ({result['fuel_cost']:.2f} \u20ac)"],
+        ["Pause déjeuner :",
+         (f"{PAUSE_DEJEUNER_MIN} min incluse" if pause_enabled else "Non comptée")],
         ["Économie optimisation :",
          f"\u2212{result['km_saved']:.1f} km  /  \u2212{int(result['time_saved_min'])} min"],
     ]
@@ -1223,8 +1232,8 @@ def export_pdf(result, tour_date, driver_name):
         bg = action_bg.get(stop["action"], colors.HexColor("#F0F0F0"))
         row_styles.append(("BACKGROUND", (1, ri), (1, ri), bg))
 
-        # ── Ligne pause déjeuner (insérée après pdf_pause_idx) ──
-        if i == pdf_pause_idx:
+        # ── Ligne pause déjeuner (insérée après pdf_pause_idx) — si activée ──
+        if pause_enabled and i == pdf_pause_idx:
             _ps, _pe = _pause_slot(result["stops_ordered"], pdf_pause_idx)
             slot_txt = f"{_ps} – {_pe}" if _ps else f"{PAUSE_DEJEUNER_MIN} min"
             pause_style = ParagraphStyle("pause_lbl", parent=styles["Normal"],
@@ -1558,15 +1567,52 @@ with st.sidebar:
                 "Aucun report automatique ne sera appliqué."
             )
 
+    st.divider()
+    st.subheader("🍽️ Pause déjeuner")
+
+    def _on_pause_change():
+        """Efface le résultat précédent pour forcer un recalcul du planning."""
+        st.session_state.result        = None
+        st.session_state.manual_order  = None
+        st.session_state.manual_result = None
+
+    st.session_state.pause_dejeuner = st.toggle(
+        f"Inclure la pause déjeuner ({PAUSE_DEJEUNER_MIN} min)",
+        value=st.session_state.pause_dejeuner,
+        on_change=_on_pause_change,
+        help=(
+            "Active ou désactive la pause méridienne de "
+            f"{PAUSE_DEJEUNER_MIN} minutes.\n\n"
+            "• **Activée** : une pause est insérée autour de midi ; elle décale "
+            "les heures d'arrivée des arrêts suivants, l'heure de retour au dépôt "
+            "et la durée totale. Elle apparaît dans le PDF et l'Excel.\n"
+            "• **Désactivée** : aucune pause n'est comptée ; le planning et les "
+            "exports sont calculés sans les 30 minutes."
+        ),
+    )
+    if st.session_state.pause_dejeuner:
+        st.caption(
+            f"🍽️ Une **pause de {PAUSE_DEJEUNER_MIN} min** sera insérée autour de "
+            "midi et reportée dans la tournée et les exports."
+        )
+    else:
+        st.caption(
+            "⛔ **Aucune pause déjeuner** ne sera comptée dans la tournée "
+            "ni dans les documents exportés."
+        )
+
     if st.session_state.result:
         st.divider()
         r = st.session_state.result
+        pause_txt = (f"🍽️ Pause : {PAUSE_DEJEUNER_MIN} min incluse"
+                     if r.get("pause_dejeuner", True) else "⛔ Sans pause déjeuner")
         st.success(
             f"✅ Dernière optimisation\n\n"
             f"**{r['distance_km']:.1f} km** · "
             f"**{int(r['duration_min']//60)}h{int(r['duration_min']%60):02d}**\n\n"
             f"⛽ {r['fuel_liters']:.1f} L ({r['fuel_cost']:.2f} €)\n\n"
-            f"⏱ Gain : {int(r['time_saved_min'])} min / {r['km_saved']:.1f} km")
+            f"⏱ Gain : {int(r['time_saved_min'])} min / {r['km_saved']:.1f} km\n\n"
+            f"{pause_txt}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ONGLETS
@@ -1929,6 +1975,7 @@ with tab_saisie:
         # il planifiera les arrêts extérieurs pendant les bouchons, et les arrêts
         # en centre-ville une fois la circulation fluide.
         eviter_peri  = st.session_state.eviter_peri
+        pause_enabled = st.session_state.pause_dejeuner
         legal_min    = (st.session_state.heure_min_depart.hour * 60
                         + st.session_state.heure_min_depart.minute)
         peri_affectes = []   # indices des arrêts dont les TW ont été injectées automatiquement
@@ -2002,10 +2049,10 @@ with tab_saisie:
             trip["order"], trip["matrix_real"], depart_min, time_windows)
         pause_idx = _find_pause_position(
             [{"departure_min": a.get("departure_min")} for a in arrivals_prelim])
-        # Passe 2 : avec pause injectée → toutes les ETAs après la pause sont correctes
+        # Passe 2 : avec pause injectée (si activée) → toutes les ETAs après la pause OK
         arrivals = _compute_arrivals(
             trip["order"], trip["matrix_real"], depart_min, time_windows,
-            pause_after_idx=pause_idx)
+            pause_after_idx=(pause_idx if pause_enabled else None))
 
         order         = trip["order"]
         stops_ordered = []
@@ -2048,7 +2095,8 @@ with tab_saisie:
             arr_idx += 1
 
         dist_km   = trip["distance_km"]
-        dur_min   = trip["duration_min"] + PAUSE_DEJEUNER_MIN  # +30 min pause déjeuner
+        # Durée = trajet OSRM + pause déjeuner (seulement si activée)
+        dur_min   = trip["duration_min"] + (PAUSE_DEJEUNER_MIN if pause_enabled else 0)
         fuel_l    = dist_km * fuel_conso / 100
         fuel_cost = fuel_l * fuel_price
         km_saved  = max(0, (orig["distance_km"]  - dist_km))  if orig else 0
@@ -2084,8 +2132,9 @@ with tab_saisie:
                 travel_back = 0
             last_dep = stops_ordered[-1]["departure_min"] or stops_ordered[-1]["arrival_min"] or depart_min
             # La pause est déjà dans last_dep si elle précède le dernier arrêt ;
-            # sinon (pause après le dernier arrêt) on l'ajoute ici.
-            if pause_idx >= len(stops_ordered) - 1:
+            # sinon (pause après le dernier arrêt) on l'ajoute ici — mais uniquement
+            # si la pause est activée.
+            if pause_enabled and pause_idx >= len(stops_ordered) - 1:
                 return_min = last_dep + travel_back + PAUSE_DEJEUNER_MIN
             else:
                 return_min = last_dep + travel_back
@@ -2107,6 +2156,9 @@ with tab_saisie:
             "depot_retour_addr":  depot_retour_addr,
             "depart_min":         depart_min,
             "return_min":         return_min,
+            # État de la pause déjeuner (utilisé par les exports, l'affichage et le
+            # recalcul manuel pour rester cohérent avec le choix de l'utilisateur)
+            "pause_dejeuner":     pause_enabled,
             # Périphérique : nb d'arrêts intra-rocade dont les TW ont été injectées
             "peri_affectes_nb":   len(peri_affectes),
             # Matrice de temps de trajet pour le recalcul manuel
@@ -2139,6 +2191,7 @@ with tab_optim:
         # Source de données active : ordre manuel si existant, sinon optimisé
         display_r  = st.session_state.manual_result or r
         is_manual  = st.session_state.manual_result is not None
+        pause_enabled = display_r.get("pause_dejeuner", True)
 
         hours = int(display_r["duration_min"] // 60)
         mins  = int(display_r["duration_min"] % 60)
@@ -2167,6 +2220,12 @@ with tab_optim:
         c7.metric("🕖 Départ dépôt",   _fmt_min(display_r.get("depart_min")))
         c8.metric("🏁 Retour dépôt",   _fmt_min(display_r.get("return_min")))
 
+        # Bandeau pause déjeuner (état actif)
+        if pause_enabled:
+            st.caption(f"🍽️ **Pause déjeuner de {PAUSE_DEJEUNER_MIN} min** comptabilisée dans cette tournée.")
+        else:
+            st.caption("⛔ **Pause déjeuner désactivée** — aucune pause n'est comptée dans cette tournée.")
+
         # Bandeau trafic périphérique
         if r.get("peri_affectes_nb", 0) > 0:
             nb = r["peri_affectes_nb"]
@@ -2183,13 +2242,24 @@ with tab_optim:
             h_tot = int(total_tour_min // 60)
             m_tot = int(total_tour_min % 60)
             interv_total = sum(s.get("duration_min", 0) for s in display_r["stops_ordered"])
-            st.info(
-                f"🗓️ **Durée totale de la tournée** (trajet + interventions + pause) : "
-                f"**{h_tot}h{m_tot:02d}** "
-                f"— dont {int(display_r['duration_min'])} min de trajet, "
-                f"{interv_total} min d'interventions "
-                f"et **{PAUSE_DEJEUNER_MIN} min de pause déjeuner** 🍽️"
-            )
+            pause_min_effective = PAUSE_DEJEUNER_MIN if pause_enabled else 0
+            trajet_min = max(0, int(display_r["duration_min"] - pause_min_effective))
+            if pause_enabled:
+                st.info(
+                    f"🗓️ **Durée totale de la tournée** (trajet + interventions + pause) : "
+                    f"**{h_tot}h{m_tot:02d}** "
+                    f"— dont {trajet_min} min de trajet, "
+                    f"{interv_total} min d'interventions "
+                    f"et **{PAUSE_DEJEUNER_MIN} min de pause déjeuner** 🍽️"
+                )
+            else:
+                st.info(
+                    f"🗓️ **Durée totale de la tournée** (trajet + interventions, sans pause) : "
+                    f"**{h_tot}h{m_tot:02d}** "
+                    f"— dont {trajet_min} min de trajet "
+                    f"et {interv_total} min d'interventions. "
+                    f"⛔ **Aucune pause déjeuner** n'est comptabilisée."
+                )
 
         st.markdown("---")
         col_map, col_list = st.columns([3, 2])
@@ -2313,8 +2383,8 @@ with tab_optim:
                     f'{tw_html}{arr_html}</div>',
                     unsafe_allow_html=True,
                 )
-                # ── Carte pause déjeuner (insérée après _pause_idx) ──
-                if not _pause_shown and _si == _pause_idx:
+                # ── Carte pause déjeuner (insérée après _pause_idx) — si activée ──
+                if pause_enabled and not _pause_shown and _si == _pause_idx:
                     _ps, _pe = _pause_slot(_stops_display, _pause_idx)
                     _slot_txt = f"{_ps} – {_pe}" if _ps else f"{PAUSE_DEJEUNER_MIN} min"
                     st.markdown(
@@ -2347,6 +2417,13 @@ with tab_export:
     else:
         r = st.session_state.result
         st.subheader("📥 Exporter la feuille de tournée")
+
+        # Rappel de l'état de la pause déjeuner tel qu'il sera exporté
+        if r.get("pause_dejeuner", True):
+            st.caption(f"🍽️ Les documents incluront la **pause déjeuner de {PAUSE_DEJEUNER_MIN} min**.")
+        else:
+            st.caption("⛔ Les documents seront générés **sans pause déjeuner**.")
+
         col_xl, col_pdf = st.columns(2)
 
         with col_xl:
