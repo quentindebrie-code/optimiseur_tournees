@@ -75,10 +75,11 @@ ACTION_MAP_ICONS = {
 # Consignes par type d'action (affichées dans le PDF)
 ACTION_CONSIGNES = {
     "Nettoyer": (
-        "Vidanger complètement la cuve. Nettoyer l'intérieur avec les produits homologués. "
+        "Vidanger complètement la cuve. Nettoyer l'intérieur à l'eau. "
         "Vérifier et réapprovisionner les consommables (papier, gel désinfectant, savon). "
         "Inspecter l'état général (porte, serrure, sol). Signaler tout dysfonctionnement "
         "ou dégradation sur la fiche de tournée."
+        "Remplissage en eau (partie lave-main) ; remplissage en eau et produits (partie WC)."
     ),
     "Déposer": (
         "Positionner l'équipement sur la zone désignée par le client, hors obstacle et "
@@ -90,7 +91,7 @@ ACTION_CONSIGNES = {
         "Vidanger la cuve avant enlèvement, même si partiellement remplie. "
         "Vérifier que la zone est propre et sans trace après retrait. "
         "Noter l'état de l'équipement au chargement (dégradation, pièce manquante). "
-        "Obtenir la signature du bon de retrait si présence du client."
+        "Nettoyage."
     ),
     "Chargement": (
         "Vérifier l'état de l'équipement avant chargement (noter les dommages existants). "
