@@ -20,6 +20,7 @@ except ImportError:
     HAS_SORTABLES = False
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.worksheet.pagebreak import Break
 
 # reportlab – gestion UTF-8 native, aucun problème d'encodage
 from reportlab.lib.pagesizes import A4
@@ -196,6 +197,55 @@ ETAT_LIEUX_INTRO = (
     "colonne Observations. La fiche datée et signée atteste de l'état constaté "
     "au moment de l'intervention."
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CASES À COCHER DESSINÉES (PDF)
+# Le caractère Unicode « ☐ » n'existe pas dans la police Helvetica de reportlab :
+# il est rendu comme un carré plein noir (glyphe .notdef). On dessine donc de
+# vraies cases vides (contour seul) via un mini-tableau, ce qui garantit un rendu
+# correct quelle que soit la police.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pdf_checkbox(size=3.4*mm):
+    """Retourne une case à cocher vide (contour seul) sous forme de flowable."""
+    cb = Table([[""]], colWidths=[size], rowHeights=[size])
+    cb.setStyle(TableStyle([
+        ("BOX",           (0, 0), (-1, -1), 0.6, colors.HexColor("#555555")),
+        ("BACKGROUND",    (0, 0), (-1, -1), colors.white),
+        ("TOPPADDING",    (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+    ]))
+    return cb
+
+
+_OPT_LABEL_STYLE = ParagraphStyle("opt_label", fontName="Helvetica",
+                                  fontSize=9, leading=11)
+
+
+def _options_inline(options):
+    """Ligne d'options « [ ] libellé » avec cases dessinées (contour seul).
+
+    options : liste de tuples (libellé, largeur_mm_du_libellé).
+    Retourne un mini-tableau à insérer comme contenu de cellule.
+    """
+    cells, widths = [], []
+    for label, w in options:
+        cells.append(_pdf_checkbox())
+        widths.append(5*mm)
+        cells.append(Paragraph(label, _OPT_LABEL_STYLE))
+        widths.append(w*mm)
+    t = Table([cells], colWidths=widths)
+    t.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 1),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 2),
+        ("TOPPADDING",    (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return t
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG PAGE
@@ -1010,10 +1060,15 @@ def generate_map_image(depot_coords, stops_ordered, geometry, depot_retour_coord
 # EXPORT — FEUILLE « ÉTAT DES LIEUX » (Excel + PDF)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def add_etat_lieux_sheet(wb, tour_date, driver_name, client_name="", equipement_ref=""):
-    """Ajoute une feuille 'État des lieux' au classeur openpyxl fourni."""
-    ws = wb.create_sheet("État des lieux")
+def _write_etat_lieux_block(ws, tour_date, driver_name,
+                            client_name="", address="", action_label="",
+                            prestation=""):
+    """Écrit UNE fiche 'état des lieux' à partir de la ligne courante de ws.
 
+    Utilise systématiquement ws.append + ws.max_row (indices relatifs) afin que
+    plusieurs fiches puissent être empilées dans la même feuille.
+    Retourne l'indice de la dernière ligne écrite.
+    """
     hdr_fill  = PatternFill("solid", fgColor="1F4E79")
     hdr_font  = Font(bold=True, color="FFFFFF", size=11)
     zone_fill = PatternFill("solid", fgColor="DCE6F1")
@@ -1025,31 +1080,34 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, client_name="", equipement_
     brd       = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     # ── Titre ──
-    ws.merge_cells("A1:F1")
-    c = ws["A1"]
-    c.value     = f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES – {tour_date.strftime('%d/%m/%Y')}"
+    ws.append([f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES – {tour_date.strftime('%d/%m/%Y')}"])
+    tr = ws.max_row
+    ws.merge_cells(f"A{tr}:F{tr}")
+    c = ws.cell(tr, 1)
     c.font      = Font(bold=True, size=15, color="1F4E79")
     c.alignment = center
-    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[tr].height = 28
 
-    # ── Bloc d'entête (opérateur / client / équipement) ──
+    # ── Bloc d'entête (opérateur / client / adresse / nature / prestation) ──
     for label, val in [
-        ("Opérateur",       driver_name or "—"),
-        ("Client / site",   client_name or "—"),
-        ("Réf. équipement", equipement_ref or "—"),
+        ("Opérateur",                driver_name or "—"),
+        ("Client / site",            client_name or "—"),
+        ("Adresse d'intervention",   address or "—"),
+        ("Nature de l'intervention", action_label or "—"),
+        ("Prestation",               prestation or "—"),
     ]:
-        r = ws.max_row + 1
-        ws.cell(r, 1).value = label + " :"
-        ws.cell(r, 1).font  = bold_f
-        ws.cell(r, 2).value = val
+        ws.append([label + " :", val])
+        r = ws.max_row
+        ws.cell(r, 1).font      = bold_f
+        ws.cell(r, 1).alignment = Alignment(horizontal="left", vertical="center")
         ws.merge_cells(f"B{r}:F{r}")
         ws.cell(r, 2).alignment = left
 
     # ── Consigne ──
-    r = ws.max_row + 1
+    ws.append([ETAT_LIEUX_INTRO])
+    r = ws.max_row
     ws.merge_cells(f"A{r}:F{r}")
     c = ws.cell(r, 1)
-    c.value     = ETAT_LIEUX_INTRO
     c.font      = Font(italic=True, size=9, color="555555")
     c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
     ws.row_dimensions[r].height = 46
@@ -1062,14 +1120,14 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, client_name="", equipement_
     hr = ws.max_row
     for col, h in enumerate(headers, 1):
         c = ws.cell(hr, col)
-        c.value = h; c.fill = hdr_fill; c.font = hdr_font
+        c.fill = hdr_fill; c.font = hdr_font
         c.alignment = center; c.border = brd
     ws.row_dimensions[hr].height = 22
 
     # ── Lignes par zone ──
     for zone, pieces in PIECES_ETAT_LIEUX:
-        zr = ws.max_row + 1
         ws.append([zone, "", "", "", "", ""])
+        zr = ws.max_row
         ws.merge_cells(f"A{zr}:F{zr}")
         zc = ws.cell(zr, 1)
         zc.fill = zone_fill; zc.font = zone_font
@@ -1097,12 +1155,12 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, client_name="", equipement_
                     c.alignment = left
             ws.row_dimensions[pr].height = 20
 
-    # ── Bloc synthèse / signature ──
+    # ── Bloc synthèse ──
     ws.append([])
-    sr = ws.max_row + 1
+    ws.append(["SYNTHÈSE DU CONTRÔLE"])
+    sr = ws.max_row
     ws.merge_cells(f"A{sr}:F{sr}")
     c = ws.cell(sr, 1)
-    c.value = "SYNTHÈSE DU CONTRÔLE"
     c.fill = hdr_fill; c.font = hdr_font
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[sr].height = 20
@@ -1112,8 +1170,8 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, client_name="", equipement_
         "Nombre de pièces à remplacer :",
         "Équipement remis en service (Oui / Non) :",
     ]:
-        r = ws.max_row + 1
-        ws.cell(r, 1).value = label
+        ws.append([label])
+        r = ws.max_row
         ws.merge_cells(f"A{r}:D{r}")
         ws.cell(r, 1).alignment = left
         ws.cell(r, 1).font = bold_f
@@ -1122,32 +1180,82 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, client_name="", equipement_
         ws.merge_cells(f"E{r}:F{r}")
         ws.row_dimensions[r].height = 20
 
+    # ── Signature ──
     ws.append([])
-    r = ws.max_row + 1
-    ws.cell(r, 1).value = "Date du contrôle :"
+    ws.append(["Date du contrôle :", tour_date.strftime('%d/%m/%Y'),
+               "", "Signature de l'opérateur :"])
+    r = ws.max_row
     ws.cell(r, 1).font = bold_f
-    ws.cell(r, 2).value = tour_date.strftime('%d/%m/%Y')
-    ws.cell(r, 4).value = "Signature de l'opérateur :"
     ws.cell(r, 4).font = bold_f
     ws.row_dimensions[r].height = 40
     for col in (1, 2, 4):
         ws.cell(r, col).alignment = Alignment(horizontal="left", vertical="top")
 
-    # ── Largeurs de colonnes ──
-    for col, width in zip(range(1, 7), [14, 42, 13, 15, 16, 40]):
+    return ws.max_row
+
+
+def add_etat_lieux_sheet(wb, tour_date, driver_name, stops=None):
+    """Ajoute une feuille 'État des lieux' contenant UNE fiche par arrêt.
+
+    Chaque fiche reprend en en-tête le client, l'adresse d'intervention et la
+    nature de l'intervention. Les fiches sont séparées par un saut de page pour
+    une impression propre (1 fiche = 1 page). Si aucun arrêt n'est fourni, une
+    fiche générique vierge est générée.
+    """
+    ws = wb.create_sheet("État des lieux")
+
+    # Largeurs de colonnes (une seule fois pour toute la feuille)
+    for col, width in zip(range(1, 7), [16, 42, 13, 15, 16, 40]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
+
+    # Mise en page impression : portrait, ajusté à la largeur d'une page
+    try:
+        from openpyxl.worksheet.properties import PageSetupProperties
+        ws.page_setup.orientation = "portrait"
+        ws.page_setup.fitToWidth  = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    except Exception:
+        pass  # la mise en page impression est un confort, non bloquant
+
+    stops = stops or []
+    if not stops:
+        _write_etat_lieux_block(ws, tour_date, driver_name)
+        return ws
+
+    n = len(stops)
+    for i, stop in enumerate(stops):
+        last_row = _write_etat_lieux_block(
+            ws, tour_date, driver_name,
+            client_name=stop.get("client", ""),
+            address=stop.get("address", ""),
+            action_label=stop.get("action", ""),
+            prestation=stop.get("quantity", ""),
+        )
+        # Saut de page après chaque fiche sauf la dernière
+        if i < n - 1:
+            ws.row_breaks.append(Break(id=last_row))
+            ws.append([])   # ligne de respiration avant la fiche suivante
 
     return ws
 
 
 def build_etat_lieux_flowables(styles, tour_date, driver_name,
-                               client_name="", equipement_ref=""):
-    """Retourne la liste de flowables reportlab pour la page État des lieux."""
+                               client_name="", address="", action_label="",
+                               prestation="", fiche_index=None, fiche_total=None):
+    """Retourne la liste de flowables reportlab pour UNE fiche État des lieux.
+
+    L'en-tête reprend le client, l'adresse d'intervention et la nature de
+    l'intervention. Les cases à cocher sont dessinées (contour seul).
+    """
     story = []
 
     title_style = ParagraphStyle("el_title", parent=styles["Heading1"],
                                  fontSize=16, textColor=colors.HexColor("#1F4E79"),
-                                 alignment=TA_CENTER, spaceAfter=4)
+                                 alignment=TA_CENTER, spaceAfter=2)
+    subtitle_style = ParagraphStyle("el_subtitle", parent=styles["Normal"],
+                                    fontSize=9, textColor=colors.grey,
+                                    alignment=TA_CENTER, spaceAfter=6)
     intro_style = ParagraphStyle("el_intro", parent=styles["Normal"],
                                  fontSize=9, textColor=colors.HexColor("#555555"),
                                  leading=12, spaceAfter=8)
@@ -1158,13 +1266,14 @@ def build_etat_lieux_flowables(styles, tour_date, driver_name,
                                 fontSize=9, leading=11)
     cell_bold  = ParagraphStyle("el_cell_bold", parent=styles["Normal"],
                                 fontSize=9, leading=11, fontName="Helvetica-Bold")
+    lbl_style  = ParagraphStyle("el_lbl", parent=styles["Normal"],
+                                fontSize=9, leading=11, fontName="Helvetica-Bold")
     hdr_style  = ParagraphStyle("el_hdr", parent=styles["Normal"],
                                 fontSize=8.5, fontName="Helvetica-Bold",
                                 textColor=colors.white, alignment=1)
     zone_style = ParagraphStyle("el_zone", parent=styles["Normal"],
                                 fontSize=9.5, fontName="Helvetica-Bold",
                                 textColor=colors.HexColor("#1F4E79"))
-    ck_style   = ParagraphStyle("el_ck", parent=cell_style, fontSize=12, alignment=1)
 
     def P(txt, style=None):
         return Paragraph(str(txt) if txt is not None else "", style or cell_style)
@@ -1172,28 +1281,37 @@ def build_etat_lieux_flowables(styles, tour_date, driver_name,
     # ── Nouvelle page ──
     story.append(PageBreak())
 
-    # ── Titre + consigne ──
-    story.append(Paragraph(
-        f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES – {tour_date.strftime('%d/%m/%Y')}",
-        title_style))
+    # ── Titre + sous-titre ──
+    story.append(Paragraph("ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES", title_style))
+    if fiche_index is not None and fiche_total is not None:
+        story.append(Paragraph(
+            f"Fiche {fiche_index} / {fiche_total} — {tour_date.strftime('%d/%m/%Y')}",
+            subtitle_style))
+    else:
+        story.append(Paragraph(tour_date.strftime('%d/%m/%Y'), subtitle_style))
     story.append(HRFlowable(width="100%", thickness=1,
                             color=colors.HexColor("#1F4E79"), spaceAfter=6))
 
-    # ── Bloc d'entête ──
+    # ── Bloc d'entête (client / adresse / nature d'intervention) ──
+    addr_para = Paragraph(
+        f"<b>Adresse d'intervention :</b>&nbsp;&nbsp;{address or '—'}", cell_style)
     entete_data = [
-        ["Opérateur :",     driver_name or "—",
-         "Réf. équipement :", equipement_ref or "—"],
-        ["Client / site :", client_name or "—",
-         "Date :",          tour_date.strftime('%d/%m/%Y')],
+        [P("Opérateur :", lbl_style),     P(driver_name or "—"),
+         P("Nature de l'intervention :", lbl_style), P(action_label or "—")],
+        [P("Client / site :", lbl_style), P(client_name or "—"),
+         P("Prestation :", lbl_style),    P(prestation or "—")],
+        [addr_para, P(""), P(""), P("")],
     ]
-    entete_table = Table(entete_data, colWidths=[28*mm, 69*mm, 30*mm, 67*mm])
+    entete_table = Table(entete_data, colWidths=[38*mm, 59*mm, 42*mm, 55*mm])
     entete_table.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("VALIGN",   (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("SPAN",          (0, 2), (3, 2)),   # adresse sur toute la largeur
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOX",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("INNERGRID",     (0, 0), (-1, -1), 0.3, colors.HexColor("#E5E5E5")),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 5),
     ]))
     story.append(entete_table)
     story.append(Spacer(1, 4*mm))
@@ -1213,7 +1331,7 @@ def build_etat_lieux_flowables(styles, tour_date, driver_name,
         for ref, desig in pieces:
             table_data.append([
                 P(ref, cell_bold), P(desig),
-                P("☐", ck_style), P("☐", ck_style), P(""), P(""),
+                _pdf_checkbox(), _pdf_checkbox(), P(""), P(""),
             ])
 
     CW = [20*mm, 62*mm, 16*mm, 20*mm, 22*mm, 54*mm]  # total = 194 mm (marges 8 mm)
@@ -1239,14 +1357,16 @@ def build_etat_lieux_flowables(styles, tour_date, driver_name,
     story.append(Paragraph("Synthèse du contrôle", section_style))
 
     synth_rows = [
-        ["État général de l'équipement :",
-         "☐ Conforme      ☐ Conforme avec réserves      ☐ Non conforme"],
-        ["Nombre de pièces à remplacer :", ""],
-        ["Équipement remis en service :", "☐ Oui        ☐ Non"],
+        [P("État général de l'équipement :", cell_bold),
+         _options_inline([("Conforme", 20),
+                          ("Conforme avec réserves", 44),
+                          ("Non conforme", 26)])],
+        [P("Nombre de pièces à remplacer :", cell_bold), P("")],
+        [P("Équipement remis en service :", cell_bold),
+         _options_inline([("Oui", 16), ("Non", 16)])],
     ]
     synth_table = Table(synth_rows, colWidths=[62*mm, 132*mm])
     synth_table.setStyle(TableStyle([
-        ("FONTNAME",      (0, 0), (0, -1), "Helvetica-Bold"),
         ("FONTSIZE",      (0, 0), (-1, -1), 9),
         ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
         ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
@@ -1390,8 +1510,8 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
     for col, width in zip(range(1, 15), [8, 14, 16, 14, 6, 22, 44, 12, 12, 12, 12, 12, 30, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
-    # ── Feuille « État des lieux » (contrôle des pièces) ──
-    add_etat_lieux_sheet(wb, tour_date, driver_name)
+    # ── Feuille « État des lieux » (une fiche par arrêt) ──
+    add_etat_lieux_sheet(wb, tour_date, driver_name, result["stops_ordered"])
 
     buf = BytesIO()
     wb.save(buf)
@@ -1723,7 +1843,7 @@ def export_pdf(result, tour_date, driver_name):
         ]))
         story.append(cl_title_table)
         check_rows = [[
-            Paragraph("☐", check_style),
+            _pdf_checkbox(),
             Paragraph(item, check_style)
         ] for item in checks]
         cl_table = Table(check_rows, colWidths=[8*mm, 186*mm])
@@ -1759,8 +1879,21 @@ def export_pdf(result, tour_date, driver_name):
     story.append(obs_table)
     story.append(Spacer(1, 4*mm))
 
-    # ── Page « État des lieux » (contrôle des pièces) ──
-    story += build_etat_lieux_flowables(styles, tour_date, driver_name)
+    # ── Pages « État des lieux » : une fiche par arrêt ──
+    _el_stops = result.get("stops_ordered", [])
+    if _el_stops:
+        _el_total = len(_el_stops)
+        for _el_i, _el_stop in enumerate(_el_stops, 1):
+            story += build_etat_lieux_flowables(
+                styles, tour_date, driver_name,
+                client_name=_el_stop.get("client", ""),
+                address=_el_stop.get("address", ""),
+                action_label=_el_stop.get("action", ""),
+                prestation=_el_stop.get("quantity", ""),
+                fiche_index=_el_i, fiche_total=_el_total,
+            )
+    else:
+        story += build_etat_lieux_flowables(styles, tour_date, driver_name)
 
     # ── Footer ──
     story.append(Spacer(1, 4*mm))
