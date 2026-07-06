@@ -1901,7 +1901,7 @@ def export_pdf(result, tour_date, driver_name):
                              color=colors.grey, spaceBefore=4))
     story.append(Paragraph(
         f"Généré le {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}"
-        " — Optimiseur de Tournées", small_style))
+        " — Deldossi Assainissement", small_style))
 
     doc.build(story)
     buf.seek(0)
