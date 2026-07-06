@@ -111,8 +111,8 @@ ACTION_CONSIGNES = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 WC_DUREES_PAR_ACTION = {
-    "Déposer":       15,   # minutes par WC chimique
-    "Retirer":       20,
+    "Déposer":       20,   # minutes par WC chimique
+    "Retirer":       15,
     "Nettoyer":      10,
     "Chargement":    15,
     "Déchargement":   5,
@@ -120,10 +120,10 @@ WC_DUREES_PAR_ACTION = {
 
 # Barème WC handicapé (options ignorées, durée × quantité)
 WC_HANDICAPE_DUREES_PAR_ACTION = {
-    "Nettoyer":      20,
+    "Nettoyer":      25,
     "Déposer":       30,
-    "Retirer":       40,
-    "Chargement":    30,
+    "Retirer":       10,
+    "Chargement":    20,
     "Déchargement":  10,
 }
 
