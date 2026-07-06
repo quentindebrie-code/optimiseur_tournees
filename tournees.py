@@ -26,7 +26,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
 from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
-                                 Paragraph, Spacer, HRFlowable, Image as RLImage)
+                                 Paragraph, Spacer, HRFlowable, PageBreak,
+                                 Image as RLImage)
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 
@@ -75,11 +76,10 @@ ACTION_MAP_ICONS = {
 # Consignes par type d'action (affichées dans le PDF)
 ACTION_CONSIGNES = {
     "Nettoyer": (
-        "Vidanger complètement la cuve. Nettoyer l'intérieur à l'eau. "
+        "Vidanger complètement la cuve. Nettoyer l'intérieur avec les produits homologués. "
         "Vérifier et réapprovisionner les consommables (papier, gel désinfectant, savon). "
         "Inspecter l'état général (porte, serrure, sol). Signaler tout dysfonctionnement "
         "ou dégradation sur la fiche de tournée."
-        "Remplissage en eau (partie lave-main) ; remplissage en eau et produits (partie WC)."
     ),
     "Déposer": (
         "Positionner l'équipement sur la zone désignée par le client, hors obstacle et "
@@ -91,7 +91,7 @@ ACTION_CONSIGNES = {
         "Vidanger la cuve avant enlèvement, même si partiellement remplie. "
         "Vérifier que la zone est propre et sans trace après retrait. "
         "Noter l'état de l'équipement au chargement (dégradation, pièce manquante). "
-        "Nettoyage."
+        "Obtenir la signature du bon de retrait si présence du client."
     ),
     "Chargement": (
         "Vérifier l'état de l'équipement avant chargement (noter les dommages existants). "
@@ -159,6 +159,43 @@ def _auto_duree(action: str, produit: str, quantite) -> int | None:
         qty = 1
     return base * qty
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOMENCLATURE DES PIÈCES À CONTRÔLER (état des lieux WC chimique)
+# Regroupées par zone d'inspection physique pour un contrôle méthodique.
+# Adaptez librement les libellés / l'ordre / les zones selon votre catalogue.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PIECES_ETAT_LIEUX = [
+    ("Porte & fermeture", [
+        ("PR034", "Poignée de porte (couleur noire)"),
+        ("PR036", "Support du verrou"),
+    ]),
+    ("Cuvette & sanitaire", [
+        ("CO002", "Lunette + cuvette des WC (couleur noire)"),
+        ("PR008", "Cylindre porte-papier hygiénique"),
+    ]),
+    ("Lave-mains & robinetterie", [
+        ("CO013", "Distributeur de savon"),
+        ("CO090", "Coussin de la pompe à pied"),
+        ("PR023", "Embout du robinet"),
+        ("PR042", "Mousseur pour robinet"),
+        ("PR041", "Embout et filtre pour mousseur"),
+        ("PR043", "Joint robinet"),
+    ]),
+    ("Structure & mobilité", [
+        ("CO001", "Roue 200 DBU N/G 20x58"),
+    ]),
+]
+
+ETAT_LIEUX_INTRO = (
+    "Fiche à compléter par l'opérateur lors du contrôle de l'équipement. "
+    "Pour chaque pièce, cochez « Bon état » si elle est présente et fonctionnelle. "
+    "En cas de pièce usée, défectueuse ou manquante, cochez « À remplacer », "
+    "indiquez la quantité à commander et précisez la nature du défaut dans la "
+    "colonne Observations. La fiche datée et signée atteste de l'état constaté "
+    "au moment de l'intervention."
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG PAGE
@@ -970,6 +1007,274 @@ def generate_map_image(depot_coords, stops_ordered, geometry, depot_retour_coord
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EXPORT — FEUILLE « ÉTAT DES LIEUX » (Excel + PDF)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_etat_lieux_sheet(wb, tour_date, driver_name, client_name="", equipement_ref=""):
+    """Ajoute une feuille 'État des lieux' au classeur openpyxl fourni."""
+    ws = wb.create_sheet("État des lieux")
+
+    hdr_fill  = PatternFill("solid", fgColor="1F4E79")
+    hdr_font  = Font(bold=True, color="FFFFFF", size=11)
+    zone_fill = PatternFill("solid", fgColor="DCE6F1")
+    zone_font = Font(bold=True, color="1F4E79", size=10)
+    bold_f    = Font(bold=True)
+    center    = Alignment(horizontal="center", vertical="center")
+    left      = Alignment(horizontal="left",  vertical="center", wrap_text=True)
+    thin      = Side(style="thin", color="CCCCCC")
+    brd       = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # ── Titre ──
+    ws.merge_cells("A1:F1")
+    c = ws["A1"]
+    c.value     = f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES – {tour_date.strftime('%d/%m/%Y')}"
+    c.font      = Font(bold=True, size=15, color="1F4E79")
+    c.alignment = center
+    ws.row_dimensions[1].height = 28
+
+    # ── Bloc d'entête (opérateur / client / équipement) ──
+    for label, val in [
+        ("Opérateur",       driver_name or "—"),
+        ("Client / site",   client_name or "—"),
+        ("Réf. équipement", equipement_ref or "—"),
+    ]:
+        r = ws.max_row + 1
+        ws.cell(r, 1).value = label + " :"
+        ws.cell(r, 1).font  = bold_f
+        ws.cell(r, 2).value = val
+        ws.merge_cells(f"B{r}:F{r}")
+        ws.cell(r, 2).alignment = left
+
+    # ── Consigne ──
+    r = ws.max_row + 1
+    ws.merge_cells(f"A{r}:F{r}")
+    c = ws.cell(r, 1)
+    c.value     = ETAT_LIEUX_INTRO
+    c.font      = Font(italic=True, size=9, color="555555")
+    c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    ws.row_dimensions[r].height = 46
+    ws.append([])
+
+    # ── En-têtes du tableau ──
+    headers = ["N° Article", "Désignation", "☑ Bon état", "☒ À remplacer",
+               "Qté à commander", "Observations"]
+    ws.append(headers)
+    hr = ws.max_row
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(hr, col)
+        c.value = h; c.fill = hdr_fill; c.font = hdr_font
+        c.alignment = center; c.border = brd
+    ws.row_dimensions[hr].height = 22
+
+    # ── Lignes par zone ──
+    for zone, pieces in PIECES_ETAT_LIEUX:
+        zr = ws.max_row + 1
+        ws.append([zone, "", "", "", "", ""])
+        ws.merge_cells(f"A{zr}:F{zr}")
+        zc = ws.cell(zr, 1)
+        zc.fill = zone_fill; zc.font = zone_font
+        zc.alignment = Alignment(horizontal="left", vertical="center")
+        zc.border = brd
+        ws.row_dimensions[zr].height = 18
+
+        for ref, desig in pieces:
+            ws.append([ref, desig, "☐", "☐", "", ""])
+            pr = ws.max_row
+            for col in range(1, 7):
+                c = ws.cell(pr, col)
+                c.border = brd
+                if col in (3, 4):        # cases à cocher
+                    c.alignment = center
+                    c.font = Font(size=13)
+                elif col == 5:           # quantité
+                    c.alignment = center
+                elif col == 2:           # désignation
+                    c.alignment = left
+                elif col == 1:           # référence
+                    c.alignment = center
+                    c.font = bold_f
+                else:                    # observations
+                    c.alignment = left
+            ws.row_dimensions[pr].height = 20
+
+    # ── Bloc synthèse / signature ──
+    ws.append([])
+    sr = ws.max_row + 1
+    ws.merge_cells(f"A{sr}:F{sr}")
+    c = ws.cell(sr, 1)
+    c.value = "SYNTHÈSE DU CONTRÔLE"
+    c.fill = hdr_fill; c.font = hdr_font
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[sr].height = 20
+
+    for label in [
+        "État général de l'équipement (Conforme / Réserves / Non conforme) :",
+        "Nombre de pièces à remplacer :",
+        "Équipement remis en service (Oui / Non) :",
+    ]:
+        r = ws.max_row + 1
+        ws.cell(r, 1).value = label
+        ws.merge_cells(f"A{r}:D{r}")
+        ws.cell(r, 1).alignment = left
+        ws.cell(r, 1).font = bold_f
+        for col in range(1, 7):
+            ws.cell(r, col).border = brd
+        ws.merge_cells(f"E{r}:F{r}")
+        ws.row_dimensions[r].height = 20
+
+    ws.append([])
+    r = ws.max_row + 1
+    ws.cell(r, 1).value = "Date du contrôle :"
+    ws.cell(r, 1).font = bold_f
+    ws.cell(r, 2).value = tour_date.strftime('%d/%m/%Y')
+    ws.cell(r, 4).value = "Signature de l'opérateur :"
+    ws.cell(r, 4).font = bold_f
+    ws.row_dimensions[r].height = 40
+    for col in (1, 2, 4):
+        ws.cell(r, col).alignment = Alignment(horizontal="left", vertical="top")
+
+    # ── Largeurs de colonnes ──
+    for col, width in zip(range(1, 7), [14, 42, 13, 15, 16, 40]):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
+
+    return ws
+
+
+def build_etat_lieux_flowables(styles, tour_date, driver_name,
+                               client_name="", equipement_ref=""):
+    """Retourne la liste de flowables reportlab pour la page État des lieux."""
+    story = []
+
+    title_style = ParagraphStyle("el_title", parent=styles["Heading1"],
+                                 fontSize=16, textColor=colors.HexColor("#1F4E79"),
+                                 alignment=TA_CENTER, spaceAfter=4)
+    intro_style = ParagraphStyle("el_intro", parent=styles["Normal"],
+                                 fontSize=9, textColor=colors.HexColor("#555555"),
+                                 leading=12, spaceAfter=8)
+    section_style = ParagraphStyle("el_section", parent=styles["Heading2"],
+                                   fontSize=12, textColor=colors.HexColor("#1F4E79"),
+                                   spaceBefore=6, spaceAfter=4)
+    cell_style = ParagraphStyle("el_cell", parent=styles["Normal"],
+                                fontSize=9, leading=11)
+    cell_bold  = ParagraphStyle("el_cell_bold", parent=styles["Normal"],
+                                fontSize=9, leading=11, fontName="Helvetica-Bold")
+    hdr_style  = ParagraphStyle("el_hdr", parent=styles["Normal"],
+                                fontSize=8.5, fontName="Helvetica-Bold",
+                                textColor=colors.white, alignment=1)
+    zone_style = ParagraphStyle("el_zone", parent=styles["Normal"],
+                                fontSize=9.5, fontName="Helvetica-Bold",
+                                textColor=colors.HexColor("#1F4E79"))
+    ck_style   = ParagraphStyle("el_ck", parent=cell_style, fontSize=12, alignment=1)
+
+    def P(txt, style=None):
+        return Paragraph(str(txt) if txt is not None else "", style or cell_style)
+
+    # ── Nouvelle page ──
+    story.append(PageBreak())
+
+    # ── Titre + consigne ──
+    story.append(Paragraph(
+        f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES – {tour_date.strftime('%d/%m/%Y')}",
+        title_style))
+    story.append(HRFlowable(width="100%", thickness=1,
+                            color=colors.HexColor("#1F4E79"), spaceAfter=6))
+
+    # ── Bloc d'entête ──
+    entete_data = [
+        ["Opérateur :",     driver_name or "—",
+         "Réf. équipement :", equipement_ref or "—"],
+        ["Client / site :", client_name or "—",
+         "Date :",          tour_date.strftime('%d/%m/%Y')],
+    ]
+    entete_table = Table(entete_data, colWidths=[28*mm, 69*mm, 30*mm, 67*mm])
+    entete_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN",   (0, 0), (-1, -1), "MIDDLE"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+    ]))
+    story.append(entete_table)
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph(ETAT_LIEUX_INTRO, intro_style))
+
+    # ── Tableau de contrôle ──
+    table_data = [[P(h, hdr_style) for h in
+                   ["N° Article", "Désignation", "Bon\nétat", "À\nremplacer",
+                    "Qté à\ncommander", "Observations"]]]
+    row_styles = []
+
+    for zone, pieces in PIECES_ETAT_LIEUX:
+        table_data.append([P(zone, zone_style), P(""), P(""), P(""), P(""), P("")])
+        zi = len(table_data) - 1
+        row_styles.append(("BACKGROUND", (0, zi), (-1, zi), colors.HexColor("#DCE6F1")))
+        row_styles.append(("SPAN", (0, zi), (-1, zi)))
+        for ref, desig in pieces:
+            table_data.append([
+                P(ref, cell_bold), P(desig),
+                P("☐", ck_style), P("☐", ck_style), P(""), P(""),
+            ])
+
+    CW = [20*mm, 62*mm, 16*mm, 20*mm, 22*mm, 54*mm]  # total = 194 mm (marges 8 mm)
+    ctrl_table = Table(table_data, colWidths=CW, repeatRows=1)
+    base = [
+        ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("ALIGN",        (0, 0), (-1, 0), "CENTER"),
+        ("ALIGN",        (2, 1), (4, -1), "CENTER"),
+        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("TOPPADDING",   (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]
+    ctrl_table.setStyle(TableStyle(base + row_styles))
+    story.append(ctrl_table)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Synthèse du contrôle ──
+    story.append(HRFlowable(width="100%", thickness=1,
+                            color=colors.HexColor("#1F4E79"), spaceBefore=2, spaceAfter=6))
+    story.append(Paragraph("Synthèse du contrôle", section_style))
+
+    synth_rows = [
+        ["État général de l'équipement :",
+         "☐ Conforme      ☐ Conforme avec réserves      ☐ Non conforme"],
+        ["Nombre de pièces à remplacer :", ""],
+        ["Équipement remis en service :", "☐ Oui        ☐ Non"],
+    ]
+    synth_table = Table(synth_rows, colWidths=[62*mm, 132*mm])
+    synth_table.setStyle(TableStyle([
+        ("FONTNAME",      (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+    ]))
+    story.append(synth_table)
+    story.append(Spacer(1, 8*mm))
+
+    # ── Signature ──
+    sign_rows = [[
+        Paragraph("Date du contrôle : " + tour_date.strftime('%d/%m/%Y'), cell_bold),
+        Paragraph("Signature de l'opérateur :", cell_bold),
+    ]]
+    sign_table = Table(sign_rows, colWidths=[97*mm, 97*mm], rowHeights=[26*mm])
+    sign_table.setStyle(TableStyle([
+        ("VALIGN",      (0, 0), (-1, -1), "TOP"),
+        ("GRID",        (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("TOPPADDING",  (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(sign_table)
+
+    return story
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EXPORT EXCEL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1084,6 +1389,9 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
 
     for col, width in zip(range(1, 15), [8, 14, 16, 14, 6, 22, 44, 12, 12, 12, 12, 12, 30, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
+
+    # ── Feuille « État des lieux » (contrôle des pièces) ──
+    add_etat_lieux_sheet(wb, tour_date, driver_name)
 
     buf = BytesIO()
     wb.save(buf)
@@ -1451,7 +1759,11 @@ def export_pdf(result, tour_date, driver_name):
     story.append(obs_table)
     story.append(Spacer(1, 4*mm))
 
+    # ── Page « État des lieux » (contrôle des pièces) ──
+    story += build_etat_lieux_flowables(styles, tour_date, driver_name)
+
     # ── Footer ──
+    story.append(Spacer(1, 4*mm))
     story.append(HRFlowable(width="100%", thickness=0.5,
                              color=colors.grey, spaceBefore=4))
     story.append(Paragraph(
@@ -2425,12 +2737,16 @@ with tab_export:
         else:
             st.caption("⛔ Les documents seront générés **sans pause déjeuner**.")
 
+        st.caption("📋 Les exports Excel et PDF incluent une page **« État des lieux »** "
+                   "de contrôle des pièces, à compléter et signer par l'opérateur.")
+
         col_xl, col_pdf = st.columns(2)
 
         with col_xl:
             st.markdown("### 📊 Excel (.xlsx)")
             st.write("Feuille de route mise en forme avec codes couleur, "
-                     "colonne heure de passage et case à cocher ✓ Fait.")
+                     "colonne heure de passage et case à cocher ✓ Fait. "
+                     "Feuille **État des lieux** incluse.")
             xl_buf = export_excel(r, st.session_state.tour_date,
                                   st.session_state.driver, fuel_price)
             st.download_button(
@@ -2442,7 +2758,8 @@ with tab_export:
         with col_pdf:
             st.markdown("### 📄 PDF")
             st.write("Document imprimable prêt pour le chauffeur, "
-                     "avec tableau coloré et récapitulatif des indicateurs.")
+                     "avec tableau coloré et récapitulatif des indicateurs. "
+                     "Page **État des lieux** incluse.")
             pdf_buf = export_pdf(r, st.session_state.tour_date,
                                  st.session_state.driver)
             st.download_button(
