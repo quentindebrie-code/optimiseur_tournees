@@ -129,20 +129,37 @@ WC_HANDICAPE_DUREES_PAR_ACTION = {
     "Déchargement":  10,
 }
 
+# Produits simples (Urinoir / Lave-main) : 10 min/produit, sauf Déposer = 15 min/produit
+PRODUITS_SIMPLES = {"Urinoir", "Lave-main"}
+PRODUIT_SIMPLE_DUREE_STD    = 10   # minutes par produit (toutes actions hors Déposer)
+PRODUIT_SIMPLE_DUREE_DEPOSE = 15   # minutes par produit pour l'action Déposer
+
 PAUSE_DEJEUNER_MIN = 30  # pause méridienne ajoutée une fois par tournée
 
 
 def _auto_duree(action: str, produit: str, quantite) -> int | None:
     """
-    Retourne la durée automatique (en minutes) pour un arrêt WC chimique
-    ou WC handicapé, ou None si le produit ne correspond à aucun des deux.
+    Retourne la durée automatique (en minutes) pour un arrêt, ou None si le
+    produit ne relève d'aucun barème automatique.
 
-    - WC chimique  : barème WC_DUREES_PAR_ACTION         × quantité
-    - WC handicapé : barème WC_HANDICAPE_DUREES_PAR_ACTION × quantité
-                     (les options sont ignorées)
+    - WC chimique      : barème WC_DUREES_PAR_ACTION            × quantité
+    - WC handicapé     : barème WC_HANDICAPE_DUREES_PAR_ACTION  × quantité
+                         (les options sont ignorées)
+    - Urinoir / Lave-main : 10 min × quantité (15 min × quantité si action Déposer)
     """
     produit_norm = str(produit).strip()
     action_norm  = str(action).strip()
+
+    try:
+        qty = max(1, int(float(quantite) or 1))
+    except (ValueError, TypeError):
+        qty = 1
+
+    # Produits simples : Urinoir / Lave-main
+    if produit_norm in PRODUITS_SIMPLES:
+        base = (PRODUIT_SIMPLE_DUREE_DEPOSE if action_norm == "Déposer"
+                else PRODUIT_SIMPLE_DUREE_STD)
+        return base * qty
 
     if produit_norm == "WC chimique":
         bareme = WC_DUREES_PAR_ACTION
@@ -154,10 +171,6 @@ def _auto_duree(action: str, produit: str, quantite) -> int | None:
     base = bareme.get(action_norm)
     if base is None:
         return None
-    try:
-        qty = max(1, int(float(quantite) or 1))
-    except (ValueError, TypeError):
-        qty = 1
     return base * qty
 
 
@@ -197,6 +210,28 @@ ETAT_LIEUX_INTRO = (
     "colonne Observations. La fiche datée et signée atteste de l'état constaté "
     "au moment de l'intervention."
 )
+
+ETAT_LIEUX_INTRO_GENERAL = (
+    "Fiche unique de contrôle des pièces pour l'ensemble de la tournée. "
+    "À compléter par l'opérateur : cochez « Bon état » pour chaque pièce présente "
+    "et fonctionnelle, « À remplacer » en cas d'usure, de défaut ou d'absence, en "
+    "indiquant la quantité à commander. Précisez le point d'intervention concerné "
+    "dans la colonne Observations si nécessaire. La fiche datée et signée atteste "
+    "de l'état constaté lors de la tournée."
+)
+
+
+def _normalize_option(df):
+    """Vide la colonne « Option » pour tout produit autre que « WC chimique ».
+
+    L'option (Urinoir / Lave-main) n'a de sens que pour le WC chimique. Cette
+    normalisation garantit qu'un Urinoir ou un Lave-main (ou un WC handicapé)
+    n'a jamais d'option renseignée, dans l'affichage comme dans les exports.
+    """
+    if "Produit" in df.columns and "Option" in df.columns:
+        mask = df["Produit"].astype(str).str.strip() != "WC chimique"
+        df.loc[mask, "Option"] = ""
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,6 +325,7 @@ if "depot_depart_key" not in st.session_state: st.session_state.depot_depart_key
 if "depot_retour_key" not in st.session_state: st.session_state.depot_retour_key = DEPOT_RETOUR_DEFAULT
 if "eviter_peri"       not in st.session_state: st.session_state.eviter_peri       = False
 if "pause_dejeuner"    not in st.session_state: st.session_state.pause_dejeuner    = True
+if "etat_lieux_par_arret" not in st.session_state: st.session_state.etat_lieux_par_arret = True
 if "manual_order"      not in st.session_state: st.session_state.manual_order      = None
 if "manual_result"     not in st.session_state: st.session_state.manual_result     = None
 
@@ -1062,11 +1098,14 @@ def generate_map_image(depot_coords, stops_ordered, geometry, depot_retour_coord
 
 def _write_etat_lieux_block(ws, tour_date, driver_name,
                             client_name="", address="", action_label="",
-                            prestation=""):
+                            prestation="", general=False, nb_arrets=None,
+                            depot_addr=""):
     """Écrit UNE fiche 'état des lieux' à partir de la ligne courante de ws.
 
     Utilise systématiquement ws.append + ws.max_row (indices relatifs) afin que
     plusieurs fiches puissent être empilées dans la même feuille.
+    Si general=True, écrit la fiche généraliste (en-tête tournée) au lieu d'une
+    fiche par arrêt.
     Retourne l'indice de la dernière ligne écrite.
     """
     hdr_fill  = PatternFill("solid", fgColor="1F4E79")
@@ -1080,7 +1119,11 @@ def _write_etat_lieux_block(ws, tour_date, driver_name,
     brd       = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     # ── Titre ──
-    ws.append([f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES – {tour_date.strftime('%d/%m/%Y')}"])
+    if general:
+        titre = f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES (FICHE TOURNÉE) – {tour_date.strftime('%d/%m/%Y')}"
+    else:
+        titre = f"ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES – {tour_date.strftime('%d/%m/%Y')}"
+    ws.append([titre])
     tr = ws.max_row
     ws.merge_cells(f"A{tr}:F{tr}")
     c = ws.cell(tr, 1)
@@ -1088,14 +1131,25 @@ def _write_etat_lieux_block(ws, tour_date, driver_name,
     c.alignment = center
     ws.row_dimensions[tr].height = 28
 
-    # ── Bloc d'entête (opérateur / client / adresse / nature / prestation) ──
-    for label, val in [
-        ("Opérateur",                driver_name or "—"),
-        ("Client / site",            client_name or "—"),
-        ("Adresse d'intervention",   address or "—"),
-        ("Nature de l'intervention", action_label or "—"),
-        ("Prestation",               prestation or "—"),
-    ]:
+    # ── Bloc d'entête ──
+    if general:
+        nb_txt = (f"{nb_arrets} arrêt(s)" if nb_arrets is not None else "—")
+        entete_rows = [
+            ("Opérateur",                driver_name or "—"),
+            ("Date de la tournée",       tour_date.strftime('%d/%m/%Y')),
+            ("Dépôt de départ",          depot_addr or "—"),
+            ("Points d'intervention",    nb_txt),
+            ("Client / site",            "(à compléter sur le terrain)"),
+        ]
+    else:
+        entete_rows = [
+            ("Opérateur",                driver_name or "—"),
+            ("Client / site",            client_name or "—"),
+            ("Adresse d'intervention",   address or "—"),
+            ("Nature de l'intervention", action_label or "—"),
+            ("Prestation",               prestation or "—"),
+        ]
+    for label, val in entete_rows:
         ws.append([label + " :", val])
         r = ws.max_row
         ws.cell(r, 1).font      = bold_f
@@ -1104,7 +1158,7 @@ def _write_etat_lieux_block(ws, tour_date, driver_name,
         ws.cell(r, 2).alignment = left
 
     # ── Consigne ──
-    ws.append([ETAT_LIEUX_INTRO])
+    ws.append([ETAT_LIEUX_INTRO_GENERAL if general else ETAT_LIEUX_INTRO])
     r = ws.max_row
     ws.merge_cells(f"A{r}:F{r}")
     c = ws.cell(r, 1)
@@ -1194,13 +1248,14 @@ def _write_etat_lieux_block(ws, tour_date, driver_name,
     return ws.max_row
 
 
-def add_etat_lieux_sheet(wb, tour_date, driver_name, stops=None):
-    """Ajoute une feuille 'État des lieux' contenant UNE fiche par arrêt.
+def add_etat_lieux_sheet(wb, tour_date, driver_name, stops=None,
+                         par_arret=True, depot_addr=""):
+    """Ajoute une feuille 'État des lieux' aux exports Excel.
 
-    Chaque fiche reprend en en-tête le client, l'adresse d'intervention et la
-    nature de l'intervention. Les fiches sont séparées par un saut de page pour
-    une impression propre (1 fiche = 1 page). Si aucun arrêt n'est fourni, une
-    fiche générique vierge est générée.
+    - par_arret=True  : UNE fiche par arrêt, pré-remplie (client, adresse, nature
+      de l'intervention), séparées par un saut de page (1 fiche = 1 page).
+    - par_arret=False : UNE seule fiche généraliste pour toute la tournée.
+    Si aucun arrêt n'est fourni, une fiche généraliste est générée.
     """
     ws = wb.create_sheet("État des lieux")
 
@@ -1219,10 +1274,16 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, stops=None):
         pass  # la mise en page impression est un confort, non bloquant
 
     stops = stops or []
-    if not stops:
-        _write_etat_lieux_block(ws, tour_date, driver_name)
+
+    # Mode généraliste (choisi par l'utilisateur ou aucun arrêt) → une seule fiche
+    if not par_arret or not stops:
+        _write_etat_lieux_block(
+            ws, tour_date, driver_name,
+            general=True, nb_arrets=len(stops), depot_addr=depot_addr,
+        )
         return ws
 
+    # Mode par arrêt → une fiche par arrêt, saut de page entre chaque
     n = len(stops)
     for i, stop in enumerate(stops):
         last_row = _write_etat_lieux_block(
@@ -1242,11 +1303,15 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, stops=None):
 
 def build_etat_lieux_flowables(styles, tour_date, driver_name,
                                client_name="", address="", action_label="",
-                               prestation="", fiche_index=None, fiche_total=None):
+                               prestation="", fiche_index=None, fiche_total=None,
+                               general=False, nb_arrets=None, depot_addr=""):
     """Retourne la liste de flowables reportlab pour UNE fiche État des lieux.
 
-    L'en-tête reprend le client, l'adresse d'intervention et la nature de
-    l'intervention. Les cases à cocher sont dessinées (contour seul).
+    - Mode par arrêt (défaut) : l'en-tête reprend le client, l'adresse
+      d'intervention et la nature de l'intervention.
+    - Mode généraliste (general=True) : fiche unique pour toute la tournée
+      (en-tête tournée : opérateur, date, dépôt, nombre de points d'intervention).
+    Les cases à cocher sont dessinées (contour seul).
     """
     story = []
 
@@ -1282,40 +1347,79 @@ def build_etat_lieux_flowables(styles, tour_date, driver_name,
     story.append(PageBreak())
 
     # ── Titre + sous-titre ──
-    story.append(Paragraph("ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES", title_style))
-    if fiche_index is not None and fiche_total is not None:
+    if general:
         story.append(Paragraph(
-            f"Fiche {fiche_index} / {fiche_total} — {tour_date.strftime('%d/%m/%Y')}",
-            subtitle_style))
+            "ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES (FICHE TOURNÉE)", title_style))
+        nb_txt = f" — {nb_arrets} arrêt(s)" if nb_arrets is not None else ""
+        story.append(Paragraph(
+            f"Tournée du {tour_date.strftime('%d/%m/%Y')}{nb_txt}", subtitle_style))
     else:
-        story.append(Paragraph(tour_date.strftime('%d/%m/%Y'), subtitle_style))
+        story.append(Paragraph("ÉTAT DES LIEUX – CONTRÔLE DES PIÈCES", title_style))
+        if fiche_index is not None and fiche_total is not None:
+            story.append(Paragraph(
+                f"Fiche {fiche_index} / {fiche_total} — {tour_date.strftime('%d/%m/%Y')}",
+                subtitle_style))
+        else:
+            story.append(Paragraph(tour_date.strftime('%d/%m/%Y'), subtitle_style))
     story.append(HRFlowable(width="100%", thickness=1,
                             color=colors.HexColor("#1F4E79"), spaceAfter=6))
 
-    # ── Bloc d'entête (client / adresse / nature d'intervention) ──
-    addr_para = Paragraph(
-        f"<b>Adresse d'intervention :</b>&nbsp;&nbsp;{address or '—'}", cell_style)
-    entete_data = [
-        [P("Opérateur :", lbl_style),     P(driver_name or "—"),
-         P("Nature de l'intervention :", lbl_style), P(action_label or "—")],
-        [P("Client / site :", lbl_style), P(client_name or "—"),
-         P("Prestation :", lbl_style),    P(prestation or "—")],
-        [addr_para, P(""), P(""), P("")],
-    ]
-    entete_table = Table(entete_data, colWidths=[38*mm, 59*mm, 42*mm, 55*mm])
-    entete_table.setStyle(TableStyle([
-        ("FONTSIZE",      (0, 0), (-1, -1), 9),
-        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ("SPAN",          (0, 2), (3, 2)),   # adresse sur toute la largeur
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING",    (0, 0), (-1, -1), 3),
-        ("BOX",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-        ("INNERGRID",     (0, 0), (-1, -1), 0.3, colors.HexColor("#E5E5E5")),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 5),
-    ]))
-    story.append(entete_table)
-    story.append(Spacer(1, 4*mm))
-    story.append(Paragraph(ETAT_LIEUX_INTRO, intro_style))
+    # ── Bloc d'entête ──
+    if general:
+        nb_lbl = f"{nb_arrets} arrêt(s)" if nb_arrets is not None else "—"
+        client_para = Paragraph(
+            "<b>Client / site :</b>&nbsp;&nbsp;<font color='#888888'>"
+            "(à compléter sur le terrain)</font>", cell_style)
+        depot_para = Paragraph(
+            f"<b>Dépôt de départ :</b>&nbsp;&nbsp;{depot_addr or '—'}", cell_style)
+        entete_data = [
+            [P("Opérateur :", lbl_style),  P(driver_name or "—"),
+             P("Date :", lbl_style),       P(tour_date.strftime('%d/%m/%Y'))],
+            [P("Points d'intervention :", lbl_style), P(nb_lbl),
+             P("", lbl_style),             P("")],
+            [depot_para, P(""), P(""), P("")],
+            [client_para, P(""), P(""), P("")],
+        ]
+        entete_table = Table(entete_data, colWidths=[42*mm, 55*mm, 42*mm, 55*mm])
+        entete_table.setStyle(TableStyle([
+            ("FONTSIZE",      (0, 0), (-1, -1), 9),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("SPAN",          (1, 1), (3, 1)),   # points d'intervention (valeur large)
+            ("SPAN",          (0, 2), (3, 2)),   # dépôt sur toute la largeur
+            ("SPAN",          (0, 3), (3, 3)),   # client sur toute la largeur
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING",    (0, 0), (-1, -1), 3),
+            ("BOX",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+            ("INNERGRID",     (0, 0), (-1, -1), 0.3, colors.HexColor("#E5E5E5")),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+        ]))
+        story.append(entete_table)
+        story.append(Spacer(1, 4*mm))
+        story.append(Paragraph(ETAT_LIEUX_INTRO_GENERAL, intro_style))
+    else:
+        addr_para = Paragraph(
+            f"<b>Adresse d'intervention :</b>&nbsp;&nbsp;{address or '—'}", cell_style)
+        entete_data = [
+            [P("Opérateur :", lbl_style),     P(driver_name or "—"),
+             P("Nature de l'intervention :", lbl_style), P(action_label or "—")],
+            [P("Client / site :", lbl_style), P(client_name or "—"),
+             P("Prestation :", lbl_style),    P(prestation or "—")],
+            [addr_para, P(""), P(""), P("")],
+        ]
+        entete_table = Table(entete_data, colWidths=[38*mm, 59*mm, 42*mm, 55*mm])
+        entete_table.setStyle(TableStyle([
+            ("FONTSIZE",      (0, 0), (-1, -1), 9),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("SPAN",          (0, 2), (3, 2)),   # adresse sur toute la largeur
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING",    (0, 0), (-1, -1), 3),
+            ("BOX",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+            ("INNERGRID",     (0, 0), (-1, -1), 0.3, colors.HexColor("#E5E5E5")),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+        ]))
+        story.append(entete_table)
+        story.append(Spacer(1, 4*mm))
+        story.append(Paragraph(ETAT_LIEUX_INTRO, intro_style))
 
     # ── Tableau de contrôle ──
     table_data = [[P(h, hdr_style) for h in
@@ -1510,8 +1614,12 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
     for col, width in zip(range(1, 15), [8, 14, 16, 14, 6, 22, 44, 12, 12, 12, 12, 12, 30, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
-    # ── Feuille « État des lieux » (une fiche par arrêt) ──
-    add_etat_lieux_sheet(wb, tour_date, driver_name, result["stops_ordered"])
+    # ── Feuille « État des lieux » (une par arrêt ou une fiche généraliste) ──
+    add_etat_lieux_sheet(
+        wb, tour_date, driver_name, result["stops_ordered"],
+        par_arret=result.get("etat_lieux_par_arret", True),
+        depot_addr=result.get("depot_depart_addr", ""),
+    )
 
     buf = BytesIO()
     wb.save(buf)
@@ -1879,9 +1987,10 @@ def export_pdf(result, tour_date, driver_name):
     story.append(obs_table)
     story.append(Spacer(1, 4*mm))
 
-    # ── Pages « État des lieux » : une fiche par arrêt ──
-    _el_stops = result.get("stops_ordered", [])
-    if _el_stops:
+    # ── Pages « État des lieux » : une par arrêt ou une fiche généraliste ──
+    _el_stops    = result.get("stops_ordered", [])
+    _el_par_arret = result.get("etat_lieux_par_arret", True)
+    if _el_par_arret and _el_stops:
         _el_total = len(_el_stops)
         for _el_i, _el_stop in enumerate(_el_stops, 1):
             story += build_etat_lieux_flowables(
@@ -1893,7 +2002,12 @@ def export_pdf(result, tour_date, driver_name):
                 fiche_index=_el_i, fiche_total=_el_total,
             )
     else:
-        story += build_etat_lieux_flowables(styles, tour_date, driver_name)
+        # Fiche généraliste unique pour toute la tournée
+        story += build_etat_lieux_flowables(
+            styles, tour_date, driver_name,
+            general=True, nb_arrets=len(_el_stops),
+            depot_addr=result.get("depot_depart_addr", ""),
+        )
 
     # ── Footer ──
     story.append(Spacer(1, 4*mm))
@@ -1901,7 +2015,7 @@ def export_pdf(result, tour_date, driver_name):
                              color=colors.grey, spaceBefore=4))
     story.append(Paragraph(
         f"Généré le {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}"
-        " — Deldossi Assainissement", small_style))
+        " — Optimiseur de Tournées", small_style))
 
     doc.build(story)
     buf.seek(0)
@@ -2047,6 +2161,32 @@ with st.sidebar:
             "ni dans les documents exportés."
         )
 
+    st.divider()
+    st.subheader("📋 Fiches état des lieux")
+
+    st.session_state.etat_lieux_par_arret = st.toggle(
+        "Une fiche par arrêt",
+        value=st.session_state.etat_lieux_par_arret,
+        help=(
+            "Contrôle le nombre de fiches d'état des lieux ajoutées aux exports "
+            "PDF et Excel :\n\n"
+            "• **Activé** : une fiche par arrêt, pré-remplie avec le client, "
+            "l'adresse et la nature de l'intervention (contrôle par équipement).\n"
+            "• **Désactivé** : une **seule fiche généraliste** pour toute la "
+            "tournée (en-tête tournée + champ à compléter sur le terrain)."
+        ),
+    )
+    if st.session_state.etat_lieux_par_arret:
+        st.caption(
+            "🧾 **Une fiche par arrêt** sera générée dans le PDF et l'Excel "
+            "(pré-remplie : client, adresse, nature de l'intervention)."
+        )
+    else:
+        st.caption(
+            "🗂️ **Une seule fiche généraliste** couvrant toute la tournée sera "
+            "générée dans le PDF et l'Excel."
+        )
+
     if st.session_state.result:
         st.divider()
         r = st.session_state.result
@@ -2106,6 +2246,8 @@ with tab_saisie:
         deleted = sorted(state.get("deleted_rows") or [], reverse=True)
         for idx in deleted:
             df = df.drop(index=idx).reset_index(drop=True)
+        # Vide l'option pour les produits sans option (Urinoir / Lave-main / WC handicapé)
+        df = _normalize_option(df)
         st.session_state.df_stops = df
 
     c1, c2, c3 = st.columns(3)
@@ -2190,11 +2332,10 @@ with tab_saisie:
     st.markdown("---")
     col_auto, col_info = st.columns([2, 3])
     with col_auto:
-        if st.button("⏱️ Précalculer les durées (WC chimiques & handicapés)",
+        if st.button("⏱️ Précalculer les durées (tous produits au barème)",
                      use_container_width=True,
                      help=(
                          "Remplit automatiquement la colonne **Durée (min)** "
-                         "pour les arrêts **WC chimique** et **WC handicapé** "
                          "selon les barèmes ci-dessous (durée × quantité) :\n\n"
                          "**WC chimique**\n"
                          "• Nettoyer : 10 min/WC\n"
@@ -2208,7 +2349,9 @@ with tab_saisie:
                          "• Retirer : 40 min/WC\n"
                          "• Chargement : 30 min/WC\n"
                          "• Déchargement : 10 min/WC\n\n"
-                         "Les autres produits ne sont pas modifiés. "
+                         "**Urinoir / Lave-main**\n"
+                         "• Déposer : 15 min/produit\n"
+                         "• Toutes les autres actions : 10 min/produit\n\n"
                          "Vous pouvez ensuite ajuster manuellement."
                      )):
             _flush_editor()
@@ -2216,6 +2359,7 @@ with tab_saisie:
             nb_maj = 0
             nb_wcc = 0   # WC chimique mis à jour
             nb_wch = 0   # WC handicapé mis à jour
+            nb_smp = 0   # Urinoir / Lave-main mis à jour
             for idx, row in df_tmp.iterrows():
                 duree_auto = _auto_duree(
                     row.get("Action", ""),
@@ -2225,8 +2369,11 @@ with tab_saisie:
                 if duree_auto is not None:
                     df_tmp.at[idx, "Durée (min)"] = duree_auto
                     nb_maj += 1
-                    if str(row.get("Produit", "")).strip() == "WC handicapé":
+                    produit = str(row.get("Produit", "")).strip()
+                    if produit == "WC handicapé":
                         nb_wch += 1
+                    elif produit in PRODUITS_SIMPLES:
+                        nb_smp += 1
                     else:
                         nb_wcc += 1
             st.session_state.df_stops = df_tmp
@@ -2238,14 +2385,16 @@ with tab_saisie:
                     details.append(f"**{nb_wcc}** WC chimique")
                 if nb_wch > 0:
                     details.append(f"**{nb_wch}** WC handicapé")
-                st.success(f"✅ Durées précalculées pour {' et '.join(details)}.")
+                if nb_smp > 0:
+                    details.append(f"**{nb_smp}** Urinoir/Lave-main")
+                st.success(f"✅ Durées précalculées pour {' · '.join(details)}.")
             else:
-                st.info("ℹ️ Aucun arrêt WC chimique ou WC handicapé trouvé à mettre à jour.")
+                st.info("ℹ️ Aucun arrêt au barème automatique trouvé à mettre à jour.")
             st.rerun()
     with col_info:
         st.caption(
-            "💡 Les durées sont calculées automatiquement (× quantité) "
-            "pour les WC chimiques et les WC handicapés. "
+            "💡 Les durées sont calculées automatiquement (× quantité) pour les "
+            "WC chimiques, les WC handicapés et les Urinoir/Lave-main. "
             "La colonne **Durée (min)** reste modifiable manuellement après précalcul."
         )
 
@@ -2272,7 +2421,8 @@ with tab_saisie:
             "Option": st.column_config.SelectboxColumn(
                 "Option (WC chim. uniquement)", width="medium",
                 options=["", "Lave-main", "Urinoir"],
-                help="Obligatoire pour WC chimique. Laissez vide pour les autres produits."),
+                help="Réservée au WC chimique. Pour un Urinoir, un Lave-main ou "
+                     "un WC handicapé, l'option est automatiquement vidée."),
             "Quantité": st.column_config.NumberColumn(
                 "Qté", required=True, width="small",
                 min_value=1, max_value=20, step=1, default=1,
@@ -2308,7 +2458,7 @@ with tab_saisie:
         key   = "editor_stops"
         df    = st.session_state.df_stops.copy()
         if key not in st.session_state:
-            return df
+            return _normalize_option(df)
         state = st.session_state[key]
         for row_idx, cols in (state.get("edited_rows") or {}).items():
             for col, val in cols.items():
@@ -2318,7 +2468,7 @@ with tab_saisie:
         deleted = sorted(state.get("deleted_rows") or [], reverse=True)
         for idx in deleted:
             df = df.drop(index=idx).reset_index(drop=True)
-        return df
+        return _normalize_option(df)
 
     live_df    = _current_df()
     valid_rows = live_df[live_df["Adresse"].fillna("").str.strip() != ""]
@@ -2338,16 +2488,11 @@ with tab_saisie:
                 "**Lave-main** (Code du travail, art. R4228-7). "
                 "S\u00e9lectionnez une option dans la colonne *Option*."
             )
-        non_wc_with_opt = valid_rows[
-            (valid_rows["Produit"] != "WC chimique") &
-            (valid_rows["Option"].fillna("").str.strip() != "")
-        ]
-        if len(non_wc_with_opt) > 0:
-            st.info(
-                f"\u2139\ufe0f **{len(non_wc_with_opt)} arr\u00eat(s)** ont une option renseign\u00e9e "
-                "alors que le produit n'est pas un WC chimique — "
-                "la colonne *Option* sera ignor\u00e9e pour ces lignes."
-            )
+        st.caption(
+            "ℹ️ La colonne *Option* n'est utilisée que pour le **WC chimique**. "
+            "Pour un **Urinoir**, un **Lave-main** ou un **WC handicapé**, "
+            "l'option est automatiquement vidée."
+        )
 
     st.markdown("---")
 
@@ -2605,6 +2750,9 @@ with tab_saisie:
             # État de la pause déjeuner (utilisé par les exports, l'affichage et le
             # recalcul manuel pour rester cohérent avec le choix de l'utilisateur)
             "pause_dejeuner":     pause_enabled,
+            # Mode des fiches état des lieux : True = une par arrêt, False = fiche
+            # généraliste unique pour toute la tournée (respecté par les exports)
+            "etat_lieux_par_arret": st.session_state.etat_lieux_par_arret,
             # Périphérique : nb d'arrêts intra-rocade dont les TW ont été injectées
             "peri_affectes_nb":   len(peri_affectes),
             # Matrice de temps de trajet pour le recalcul manuel
@@ -2870,8 +3018,18 @@ with tab_export:
         else:
             st.caption("⛔ Les documents seront générés **sans pause déjeuner**.")
 
-        st.caption("📋 Les exports Excel et PDF incluent une page **« État des lieux »** "
-                   "de contrôle des pièces, à compléter et signer par l'opérateur.")
+        # Rappel du mode des fiches état des lieux tel qu'il sera exporté
+        if r.get("etat_lieux_par_arret", True):
+            _nb = len(r.get("stops_ordered", []))
+            st.caption(
+                f"📋 Les exports incluront **{_nb} fiche(s) « État des lieux »** "
+                "(une par arrêt), pré-remplies et à signer par l'opérateur."
+            )
+        else:
+            st.caption(
+                "🗂️ Les exports incluront **une seule fiche « État des lieux » "
+                "généraliste** couvrant toute la tournée, à compléter et signer."
+            )
 
         col_xl, col_pdf = st.columns(2)
 
