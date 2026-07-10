@@ -1,15 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Dépendances FIGÉES — Optimiseur de Tournées (Deldossi Assainissement)
-#
-# Versions verrouillées volontairement : sur Streamlit Community Cloud, une
-# reconstruction automatique de l'environnement peut mettre à jour une
-# dépendance non figée vers une version cassante et faire planter l'app au
-# chargement. Le verrouillage ci-dessous supprime ce risque.
-#
-# Jeu de versions validé (l'app se charge sans erreur avec exactement celles-ci).
-# Pour mettre à jour un package, changez une seule ligne à la fois et retestez.
-# ─────────────────────────────────────────────────────────────────────────────
-
 streamlit==1.59.1
 pandas==3.0.2
 numpy==2.4.4
