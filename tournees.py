@@ -321,6 +321,7 @@ st.markdown("""
 
 def _init_df():
     return pd.DataFrame({
+        "Suppr":         [False,         False,         False],
         "Action":        ["Nettoyer",    "Nettoyer",    "Nettoyer"],
         "Produit":       ["WC chimique", "WC chimique", "WC chimique"],
         "Option":        ["Lave-main",   "Lave-main",   "Lave-main"],
@@ -2306,11 +2307,24 @@ with tab_saisie:
         st.markdown(chips, unsafe_allow_html=True)
         st.markdown("")
 
+        # Colonne de sélection pour la suppression (migration + typage booléen)
+        if "Suppr" not in st.session_state.df_stops.columns:
+            st.session_state.df_stops.insert(0, "Suppr", False)
+        st.session_state.df_stops["Suppr"] = (
+            st.session_state.df_stops["Suppr"].fillna(False).astype(bool))
+
         st.data_editor(
             st.session_state.df_stops,
             use_container_width=True,
             num_rows="dynamic",
+            column_order=["Suppr", "Action", "Produit", "Option", "Quantité",
+                          "Nom du client", "Adresse", "Durée (min)",
+                          "Pas avant", "Pas après", "Observations"],
             column_config={
+                "Suppr": st.column_config.CheckboxColumn(
+                    "🗑️", width="small", default=False,
+                    help="Cochez les lignes à supprimer, puis cliquez sur "
+                         "« Supprimer la sélection » à droite."),
                 "Action": st.column_config.SelectboxColumn(
                     "Action", required=True, width="small",
                     options=["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]),
@@ -2379,6 +2393,7 @@ with tab_saisie:
         if st.button("➕ Ajouter un arrêt", use_container_width=True):
             _flush_editor()
             new_row = pd.DataFrame({
+                "Suppr": [False],
                 "Action": ["Nettoyer"], "Produit": ["WC chimique"],
                 "Option": ["Lave-main"], "Quantité": [1],
                 "Nom du client": [""], "Adresse": [""],
@@ -2407,45 +2422,37 @@ with tab_saisie:
                 del st.session_state["editor_stops"]
             st.rerun()
 
-        # ── Suppression ciblée de lignes ──
-        if len(st.session_state.df_stops) > 1:
-            st.divider()
-            st.markdown("**Suppression ciblée**")
-            df_preview = st.session_state.df_stops.copy()
-            key_state = st.session_state.get("editor_stops", {})
-            for row_idx, cols in (key_state.get("edited_rows") or {}).items():
-                for col, val in cols.items():
-                    df_preview.at[int(row_idx), col] = val
-            row_labels = {}
-            for i, row in df_preview.iterrows():
-                addr_short = str(row.get("Adresse") or "").strip()[:22] or "(sans adresse)"
-                client_short = str(row.get("Nom du client") or "").strip()
-                suffix = f" · {client_short}" if client_short else ""
-                row_labels[i] = f"L{i + 1} · {row.get('Action','?')} · {addr_short}{suffix}"
-            selected_idxs = st.multiselect(
-                "Lignes à supprimer",
-                options=list(row_labels.keys()),
-                format_func=lambda i: row_labels[i],
-                key="rows_to_delete",
-                label_visibility="collapsed",
-                placeholder="Choisir des lignes…",
-            )
-            if st.button("🗑️ Supprimer la sélection",
-                         use_container_width=True,
-                         disabled=not selected_idxs,
-                         help="Supprime les lignes sélectionnées (au moins une ligne sera conservée)"):
-                _flush_editor()
-                remaining = [i for i in st.session_state.df_stops.index
-                             if i not in selected_idxs]
-                if len(remaining) == 0:
-                    st.warning("⚠️ Impossible de supprimer toutes les lignes.")
-                else:
-                    st.session_state.df_stops = (
-                        st.session_state.df_stops.loc[remaining].reset_index(drop=True)
-                    )
+        # ── Suppression des lignes cochées dans le tableau ──
+        st.divider()
+        sel_count = 0
+        if "Suppr" in live_df.columns:
+            sel_count = int(live_df["Suppr"].fillna(False).astype(bool).sum())
+        btn_label = ("🗑️ Supprimer la sélection"
+                     + (f" ({sel_count})" if sel_count else ""))
+        if st.button(btn_label,
+                     use_container_width=True,
+                     type="secondary",
+                     disabled=(sel_count == 0),
+                     help="Cochez la colonne 🗑️ des lignes à supprimer dans le "
+                          "tableau, puis cliquez ici."):
+            df_view = _current_df()
+            if "Suppr" in df_view.columns:
+                keep_mask = ~df_view["Suppr"].fillna(False).astype(bool)
+            else:
+                keep_mask = pd.Series([True] * len(df_view), index=df_view.index)
+            if int(keep_mask.sum()) == 0:
+                st.warning("⚠️ Impossible de supprimer toutes les lignes "
+                           "(au moins une doit rester).")
+            else:
+                keep = df_view[keep_mask].copy()
+                keep["Suppr"] = False
+                st.session_state.df_stops = keep.reset_index(drop=True)
                 if "editor_stops" in st.session_state:
                     del st.session_state["editor_stops"]
                 st.rerun()
+        if sel_count == 0:
+            st.caption("Cochez la colonne 🗑️ dans le tableau pour sélectionner "
+                       "des lignes à supprimer.")
 
     # ══════════════════════════════════════════════════════════════════════════
     # BLOC 2 — PRÉCALCUL DES DURÉES
