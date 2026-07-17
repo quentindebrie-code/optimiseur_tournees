@@ -2218,16 +2218,7 @@ tab_saisie, tab_optim, tab_export = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_saisie:
-    st.subheader("Saisie des arrêts de la tournée")
-    st.info(
-        f"💡 Saisissez vos arrêts ci-dessous. "
-        f"Départ : **{st.session_state.depot_depart_key}** · "
-        f"Retour : **{st.session_state.depot_retour_key}**. "
-        f"L'ordre de saisie n'a pas d'importance.")
-
-    # ── Fusion des éditions en cours dans df_stops avant tout bouton ──
-    # On récupère les modifications du data_editor depuis son état interne
-    # (st.session_state["editor_stops"]) pour ne pas perdre les saisies.
+    # ── Helpers (définis avant toute utilisation) ─────────────────────────────
     def _flush_editor():
         """Applique les édits en cours du tableau dans df_stops."""
         key = "editor_stops"
@@ -2250,8 +2241,115 @@ with tab_saisie:
         df = _normalize_option(df)
         st.session_state.df_stops = df
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
+    def _current_df():
+        """Retourne le df avec les éditions non encore flushées."""
+        key   = "editor_stops"
+        df    = st.session_state.df_stops.copy()
+        if key not in st.session_state:
+            return _normalize_option(df)
+        state = st.session_state[key]
+        for row_idx, cols in (state.get("edited_rows") or {}).items():
+            for col, val in cols.items():
+                df.at[int(row_idx), col] = val
+        for row in (state.get("added_rows") or []):
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        deleted = sorted(state.get("deleted_rows") or [], reverse=True)
+        for idx in deleted:
+            df = df.drop(index=idx).reset_index(drop=True)
+        return _normalize_option(df)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 1 — TABLEAU DE SAISIE (+ actions sur le côté)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 1\ufe0f\u20e3  Tableau de saisie des arrêts")
+    st.caption(
+        f"Départ : **{st.session_state.depot_depart_key}** · "
+        f"Retour : **{st.session_state.depot_retour_key}** · "
+        f"l'ordre de saisie n'a pas d'importance."
+    )
+
+    col_table, col_side = st.columns([4, 1.3], gap="medium")
+
+    with col_table:
+        # Légende des actions (inline, sans colonnes imbriquées)
+        chips = " ".join(
+            f'<span style="background:{c};padding:2px 8px;border-radius:4px;'
+            f'font-size:0.8em;margin-right:4px">■ {a}</span>'
+            for a, c in ACTION_COLORS.items()
+        )
+        st.markdown(chips, unsafe_allow_html=True)
+        st.markdown("")
+
+        st.data_editor(
+            st.session_state.df_stops,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Action": st.column_config.SelectboxColumn(
+                    "Action", required=True, width="small",
+                    options=["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]),
+                "Produit": st.column_config.SelectboxColumn(
+                    "Produit", required=True, width="medium",
+                    options=["WC chimique", "Lave-main", "Urinoir", "WC handicapé"]),
+                "Option": st.column_config.SelectboxColumn(
+                    "Option (WC chim. uniquement)", width="medium",
+                    options=["", "Lave-main", "Urinoir"],
+                    help="Réservée au WC chimique. Pour un Urinoir, un Lave-main ou "
+                         "un WC handicapé, l'option est automatiquement vidée."),
+                "Quantité": st.column_config.NumberColumn(
+                    "Qté", required=True, width="small",
+                    min_value=1, max_value=20, step=1, default=1,
+                    help="Nombre d'unités. Pour WC chimique : 1 option par WC."),
+                "Nom du client": st.column_config.TextColumn(
+                    "Nom du client", width="medium"),
+                "Adresse": st.column_config.TextColumn(
+                    "Adresse complète (rue, ville, CP)", width="large",
+                    help="Ex : Place d'Hautpoul 81600 Gaillac"),
+                "Durée (min)": st.column_config.NumberColumn(
+                    "⏱ Durée (min)", width="small", min_value=1, max_value=480,
+                    step=5, default=30,
+                    help="Durée de l'intervention sur place en minutes (ex: 30)"),
+                "Pas avant": st.column_config.TextColumn(
+                    "⏰ Pas avant", width="small",
+                    help="Arriver au plus tôt à cette heure (format HH:MM). Ex : 09:00"),
+                "Pas après": st.column_config.TextColumn(
+                    "⏰ Pas après", width="small",
+                    help="Arriver au plus tard à cette heure (format HH:MM). Ex : 11:30"),
+                "Observations": st.column_config.TextColumn(
+                    "📝 Observations", width="large",
+                    help="Notes ou remarques particulières pour cet arrêt (ex : code portail, contact sur place…)"),
+            },
+            hide_index=False,
+            key="editor_stops",
+        )
+        # df_stops n'est réécrit que par _flush_editor() lors d'une action.
+
+        live_df    = _current_df()
+        valid_rows = live_df[live_df["Adresse"].fillna("").str.strip() != ""]
+        n_valid    = len(valid_rows)
+        st.caption(f"📍 **{n_valid}** arrêt(s) avec adresse renseignée")
+
+        # Validation Produit / Option
+        if "Produit" in live_df.columns and "Option" in live_df.columns:
+            wc_rows_no_opt = valid_rows[
+                (valid_rows["Produit"] == "WC chimique") &
+                (valid_rows["Option"].fillna("").str.strip() == "")
+            ]
+            if len(wc_rows_no_opt) > 0:
+                st.warning(
+                    f"\U0001f6bd **{len(wc_rows_no_opt)} arr\u00eat(s) avec WC chimique sans option.** "
+                    "Chaque WC chimique doit \u00eatre accompagn\u00e9 d'un **Urinoir** ou d'un "
+                    "**Lave-main** (Code du travail, art. R4228-7). "
+                    "S\u00e9lectionnez une option dans la colonne *Option*."
+                )
+            st.caption(
+                "ℹ️ La colonne *Option* n'est utilisée que pour le **WC chimique**. "
+                "Pour un **Urinoir**, un **Lave-main** ou un **WC handicapé**, "
+                "l'option est automatiquement vidée."
+            )
+
+    with col_side:
+        st.markdown("**Actions**")
         if st.button("➕ Ajouter un arrêt", use_container_width=True):
             _flush_editor()
             new_row = pd.DataFrame({
@@ -2263,11 +2361,10 @@ with tab_saisie:
             })
             st.session_state.df_stops = pd.concat(
                 [st.session_state.df_stops, new_row], ignore_index=True)
-            # Reset l'état interne du data_editor pour repartir proprement
             if "editor_stops" in st.session_state:
                 del st.session_state["editor_stops"]
             st.rerun()
-    with c2:
+
         if st.button("➖ Supprimer le dernier", use_container_width=True):
             _flush_editor()
             if len(st.session_state.df_stops) > 1:
@@ -2276,7 +2373,7 @@ with tab_saisie:
             if "editor_stops" in st.session_state:
                 del st.session_state["editor_stops"]
             st.rerun()
-    with c3:
+
         if st.button("🗑️ Tout vider", use_container_width=True, type="secondary"):
             st.session_state.df_stops = _init_df()
             st.session_state.result   = None
@@ -2284,52 +2381,51 @@ with tab_saisie:
                 del st.session_state["editor_stops"]
             st.rerun()
 
-    # ── Suppression de lignes sélectionnées ──
-    if len(st.session_state.df_stops) > 1:
-        df_preview = st.session_state.df_stops.copy()
-        # Génère un libellé lisible par ligne (avant flush, pour la preview)
-        key_state = st.session_state.get("editor_stops", {})
-        for row_idx, cols in (key_state.get("edited_rows") or {}).items():
-            for col, val in cols.items():
-                df_preview.at[int(row_idx), col] = val
-        row_labels = {}
-        for i, row in df_preview.iterrows():
-            addr_short = str(row.get("Adresse") or "").strip()[:40] or "(sans adresse)"
-            client_short = str(row.get("Nom du client") or "").strip()
-            suffix = f" · {client_short}" if client_short else ""
-            row_labels[i] = f"Ligne {i + 1} — {row.get('Action','?')} · {addr_short}{suffix}"
-        sel_col, btn_col2 = st.columns([4, 1])
-        with sel_col:
+        # ── Suppression ciblée de lignes ──
+        if len(st.session_state.df_stops) > 1:
+            st.divider()
+            st.markdown("**Suppression ciblée**")
+            df_preview = st.session_state.df_stops.copy()
+            key_state = st.session_state.get("editor_stops", {})
+            for row_idx, cols in (key_state.get("edited_rows") or {}).items():
+                for col, val in cols.items():
+                    df_preview.at[int(row_idx), col] = val
+            row_labels = {}
+            for i, row in df_preview.iterrows():
+                addr_short = str(row.get("Adresse") or "").strip()[:22] or "(sans adresse)"
+                client_short = str(row.get("Nom du client") or "").strip()
+                suffix = f" · {client_short}" if client_short else ""
+                row_labels[i] = f"L{i + 1} · {row.get('Action','?')} · {addr_short}{suffix}"
             selected_idxs = st.multiselect(
-                "Sélectionner des lignes à supprimer :",
+                "Lignes à supprimer",
                 options=list(row_labels.keys()),
                 format_func=lambda i: row_labels[i],
                 key="rows_to_delete",
                 label_visibility="collapsed",
-                placeholder="Sélectionner des lignes à supprimer…",
+                placeholder="Choisir des lignes…",
             )
-        with btn_col2:
             if st.button("🗑️ Supprimer la sélection",
                          use_container_width=True,
                          disabled=not selected_idxs,
                          help="Supprime les lignes sélectionnées (au moins une ligne sera conservée)"):
                 _flush_editor()
-                # On ne supprime pas si ça laisserait 0 ligne
                 remaining = [i for i in st.session_state.df_stops.index
                              if i not in selected_idxs]
                 if len(remaining) == 0:
                     st.warning("⚠️ Impossible de supprimer toutes les lignes.")
                 else:
                     st.session_state.df_stops = (
-                        st.session_state.df_stops.loc[remaining]
-                        .reset_index(drop=True)
+                        st.session_state.df_stops.loc[remaining].reset_index(drop=True)
                     )
                 if "editor_stops" in st.session_state:
                     del st.session_state["editor_stops"]
                 st.rerun()
 
-    # ── Bouton précalcul automatique des durées ──
-    st.markdown("---")
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 2 — PRÉCALCUL DES DURÉES
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 2\ufe0f\u20e3  Précalcul des durées")
     col_auto, col_info = st.columns([2, 3])
     with col_auto:
         if st.button("⏱️ Précalculer les durées (tous produits au barème)",
@@ -2398,103 +2494,11 @@ with tab_saisie:
             "La colonne **Durée (min)** reste modifiable manuellement après précalcul."
         )
 
-    st.markdown("---")
-    leg_cols = st.columns(3)
-    for col, (action, color) in zip(leg_cols, ACTION_COLORS.items()):
-        col.markdown(
-            f'<span style="background:{color};padding:3px 10px;'
-            f'border-radius:4px;font-size:0.85em">■ {action}</span>',
-            unsafe_allow_html=True)
-    st.markdown("")
-
-    st.data_editor(
-        st.session_state.df_stops,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "Action": st.column_config.SelectboxColumn(
-                "Action", required=True, width="small",
-                options=["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]),
-            "Produit": st.column_config.SelectboxColumn(
-                "Produit", required=True, width="medium",
-                options=["WC chimique", "Lave-main", "Urinoir", "WC handicapé"]),
-            "Option": st.column_config.SelectboxColumn(
-                "Option (WC chim. uniquement)", width="medium",
-                options=["", "Lave-main", "Urinoir"],
-                help="Réservée au WC chimique. Pour un Urinoir, un Lave-main ou "
-                     "un WC handicapé, l'option est automatiquement vidée."),
-            "Quantité": st.column_config.NumberColumn(
-                "Qté", required=True, width="small",
-                min_value=1, max_value=20, step=1, default=1,
-                help="Nombre d'unités. Pour WC chimique : 1 option par WC."),
-            "Nom du client": st.column_config.TextColumn(
-                "Nom du client", width="medium"),
-            "Adresse": st.column_config.TextColumn(
-                "Adresse complète (rue, ville, CP)", width="large",
-                help="Ex : Place d'Hautpoul 81600 Gaillac"),
-            "Durée (min)": st.column_config.NumberColumn(
-                "⏱ Durée (min)", width="small", min_value=1, max_value=480,
-                step=5, default=30,
-                help="Durée de l'intervention sur place en minutes (ex: 30)"),
-            "Pas avant": st.column_config.TextColumn(
-                "⏰ Pas avant", width="small",
-                help="Arriver au plus tôt à cette heure (format HH:MM). Ex : 09:00"),
-            "Pas après": st.column_config.TextColumn(
-                "⏰ Pas après", width="small",
-                help="Arriver au plus tard à cette heure (format HH:MM). Ex : 11:30"),
-            "Observations": st.column_config.TextColumn(
-                "📝 Observations", width="large",
-                help="Notes ou remarques particulières pour cet arrêt (ex : code portail, contact sur place…)"),
-        },
-        hide_index=False,
-        key="editor_stops",
-    )
-    # Ne pas réécrire df_stops ici — c'est _flush_editor() qui le fait
-    # uniquement quand une action (bouton, optimisation) est déclenchée.
-
-    # Comptage des adresses valides en lisant l'état en temps réel
-    def _current_df():
-        """Retourne le df avec les éditions non encore flushées."""
-        key   = "editor_stops"
-        df    = st.session_state.df_stops.copy()
-        if key not in st.session_state:
-            return _normalize_option(df)
-        state = st.session_state[key]
-        for row_idx, cols in (state.get("edited_rows") or {}).items():
-            for col, val in cols.items():
-                df.at[int(row_idx), col] = val
-        for row in (state.get("added_rows") or []):
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        deleted = sorted(state.get("deleted_rows") or [], reverse=True)
-        for idx in deleted:
-            df = df.drop(index=idx).reset_index(drop=True)
-        return _normalize_option(df)
-
-    live_df    = _current_df()
-    valid_rows = live_df[live_df["Adresse"].fillna("").str.strip() != ""]
-    n_valid    = len(valid_rows)
-    st.caption(f"📍 **{n_valid}** arrêt(s) avec adresse renseignée")
-
-    # Validation Produit / Option
-    if "Produit" in live_df.columns and "Option" in live_df.columns:
-        wc_rows_no_opt = valid_rows[
-            (valid_rows["Produit"] == "WC chimique") &
-            (valid_rows["Option"].fillna("").str.strip() == "")
-        ]
-        if len(wc_rows_no_opt) > 0:
-            st.warning(
-                f"\U0001f6bd **{len(wc_rows_no_opt)} arr\u00eat(s) avec WC chimique sans option.** "
-                "Chaque WC chimique doit \u00eatre accompagn\u00e9 d'un **Urinoir** ou d'un "
-                "**Lave-main** (Code du travail, art. R4228-7). "
-                "S\u00e9lectionnez une option dans la colonne *Option*."
-            )
-        st.caption(
-            "ℹ️ La colonne *Option* n'est utilisée que pour le **WC chimique**. "
-            "Pour un **Urinoir**, un **Lave-main** ou un **WC handicapé**, "
-            "l'option est automatiquement vidée."
-        )
-
-    st.markdown("---")
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 3 — OPTIMISATION DE LA TOURNÉE
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 3\ufe0f\u20e3  Optimisation de la tournée")
 
     if st.button("🚀 Optimiser la tournée", type="primary",
                  use_container_width=True, disabled=(n_valid < 1)):
