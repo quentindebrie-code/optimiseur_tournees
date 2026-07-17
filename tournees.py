@@ -234,6 +234,23 @@ def _normalize_option(df):
     return df
 
 
+def _etat_lieux_prestation_parts(stop):
+    """Retourne (produit_label, option_label) pour l'en-tête d'une fiche.
+
+    Ex. WC chimique + option Lave-main, qté 2 → ('2 × WC chimique', '2 × Lave-main').
+    Sans option → ('1 × Urinoir', '—').
+    """
+    try:
+        q = int(stop.get("qty_num", 1) or 1)
+    except (ValueError, TypeError):
+        q = 1
+    produit = str(stop.get("produit", "") or "").strip()
+    option  = str(stop.get("option", "") or "").strip()
+    produit_label = f"{q} × {produit}" if produit else "—"
+    option_label  = f"{q} × {option}"  if option  else "—"
+    return produit_label, option_label
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CASES À COCHER DESSINÉES (PDF)
 # Le caractère Unicode « ☐ » n'existe pas dans la police Helvetica de reportlab :
@@ -1098,8 +1115,8 @@ def generate_map_image(depot_coords, stops_ordered, geometry, depot_retour_coord
 
 def _write_etat_lieux_block(ws, tour_date, driver_name,
                             client_name="", address="", action_label="",
-                            prestation="", general=False, nb_arrets=None,
-                            depot_addr=""):
+                            produit_label="", option_label="", general=False,
+                            nb_arrets=None, depot_addr=""):
     """Écrit UNE fiche 'état des lieux' à partir de la ligne courante de ws.
 
     Utilise systématiquement ws.append + ws.max_row (indices relatifs) afin que
@@ -1147,7 +1164,8 @@ def _write_etat_lieux_block(ws, tour_date, driver_name,
             ("Client / site",            client_name or "—"),
             ("Adresse d'intervention",   address or "—"),
             ("Nature de l'intervention", action_label or "—"),
-            ("Prestation",               prestation or "—"),
+            ("Produit",                  produit_label or "—"),
+            ("Option",                   option_label or "—"),
         ]
     for label, val in entete_rows:
         ws.append([label + " :", val])
@@ -1286,12 +1304,14 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, stops=None,
     # Mode par arrêt → une fiche par arrêt, saut de page entre chaque
     n = len(stops)
     for i, stop in enumerate(stops):
+        _produit_label, _option_label = _etat_lieux_prestation_parts(stop)
         last_row = _write_etat_lieux_block(
             ws, tour_date, driver_name,
             client_name=stop.get("client", ""),
             address=stop.get("address", ""),
             action_label=stop.get("action", ""),
-            prestation=stop.get("quantity", ""),
+            produit_label=_produit_label,
+            option_label=_option_label,
         )
         # Saut de page après chaque fiche sauf la dernière
         if i < n - 1:
@@ -1303,7 +1323,8 @@ def add_etat_lieux_sheet(wb, tour_date, driver_name, stops=None,
 
 def build_etat_lieux_flowables(styles, tour_date, driver_name,
                                client_name="", address="", action_label="",
-                               prestation="", fiche_index=None, fiche_total=None,
+                               produit_label="", option_label="",
+                               fiche_index=None, fiche_total=None,
                                general=False, nb_arrets=None, depot_addr=""):
     """Retourne la liste de flowables reportlab pour UNE fiche État des lieux.
 
@@ -1397,20 +1418,24 @@ def build_etat_lieux_flowables(styles, tour_date, driver_name,
         story.append(Spacer(1, 4*mm))
         story.append(Paragraph(ETAT_LIEUX_INTRO_GENERAL, intro_style))
     else:
+        option_para = Paragraph(
+            f"<b>Option :</b>&nbsp;&nbsp;{option_label or '—'}", cell_style)
         addr_para = Paragraph(
             f"<b>Adresse d'intervention :</b>&nbsp;&nbsp;{address or '—'}", cell_style)
         entete_data = [
             [P("Opérateur :", lbl_style),     P(driver_name or "—"),
              P("Nature de l'intervention :", lbl_style), P(action_label or "—")],
             [P("Client / site :", lbl_style), P(client_name or "—"),
-             P("Prestation :", lbl_style),    P(prestation or "—")],
+             P("Produit :", lbl_style),       P(produit_label or "—")],
+            [option_para, P(""), P(""), P("")],
             [addr_para, P(""), P(""), P("")],
         ]
         entete_table = Table(entete_data, colWidths=[38*mm, 59*mm, 42*mm, 55*mm])
         entete_table.setStyle(TableStyle([
             ("FONTSIZE",      (0, 0), (-1, -1), 9),
             ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-            ("SPAN",          (0, 2), (3, 2)),   # adresse sur toute la largeur
+            ("SPAN",          (0, 2), (3, 2)),   # option sur toute la largeur
+            ("SPAN",          (0, 3), (3, 3)),   # adresse sur toute la largeur
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ("TOPPADDING",    (0, 0), (-1, -1), 3),
             ("BOX",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
@@ -1993,12 +2018,13 @@ def export_pdf(result, tour_date, driver_name):
     if _el_par_arret and _el_stops:
         _el_total = len(_el_stops)
         for _el_i, _el_stop in enumerate(_el_stops, 1):
+            _pl, _ol = _etat_lieux_prestation_parts(_el_stop)
             story += build_etat_lieux_flowables(
                 styles, tour_date, driver_name,
                 client_name=_el_stop.get("client", ""),
                 address=_el_stop.get("address", ""),
                 action_label=_el_stop.get("action", ""),
-                prestation=_el_stop.get("quantity", ""),
+                produit_label=_pl, option_label=_ol,
                 fiche_index=_el_i, fiche_total=_el_total,
             )
     else:
@@ -2290,7 +2316,7 @@ with tab_saisie:
                     options=["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]),
                 "Produit": st.column_config.SelectboxColumn(
                     "Produit", required=True, width="medium",
-                    options=["WC chimique", "Lave-main", "Urinoir", "WC handicapé"]),
+                    options=["WC chimique", "Lave-main", "Urinoir", "WC handicapé", "WC client"]),
                 "Option": st.column_config.SelectboxColumn(
                     "Option (WC chim. uniquement)", width="medium",
                     options=["", "Lave-main", "Urinoir"],
