@@ -12,6 +12,8 @@ from geopy.geocoders import Nominatim
 import time
 from io import BytesIO
 import datetime
+import unicodedata
+import re as _re_stock
 
 try:
     from streamlit_sortables import sort_items as _sortables_sort_items
@@ -174,6 +176,596 @@ def _auto_duree(action: str, produit: str, quantite) -> int | None:
     return base * qty
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# GESTION DU PARC : COULEURS, ARTICLES, STOCKS
+# ═════════════════════════════════════════════════════════════════════════════
+# Modèle de données
+# -----------------
+# Le parc est décrit par un tableau à 4 colonnes :
+#     Article | Couleur | Installés | En stock
+# « Article » est la référence commerciale telle que manipulée par l'exploitation
+# (ex. « WC chimique + Lave-main »). Elle est dérivée du couple Produit/Option
+# saisi dans le tableau des arrêts via _article_key().
+# « Installés » = unités actuellement chez les clients ; « En stock » = unités
+# disponibles au dépôt. Parc total = Installés + En stock.
+# ═════════════════════════════════════════════════════════════════════════════
+
+COULEURS_PRODUITS = ["Vert", "Jaune", "Rose", "Bleu", "Orange", "Crème", "Blanc", "Gris"]
+
+# Pastilles de couleur (fond) + couleur de texte lisible sur ce fond
+COULEUR_HEX = {
+    "Vert":   "#2E7D32",
+    "Jaune":  "#F9A825",
+    "Rose":   "#EC407A",
+    "Bleu":   "#1E88E5",
+    "Orange": "#EF6C00",
+    "Crème":  "#D9C89E",
+    "Blanc":  "#FFFFFF",
+    "Gris":   "#9E9E9E",
+    "":       "#E0E0E0",
+}
+COULEUR_TEXTE = {
+    "Jaune": "#3E2723", "Crème": "#3E2723", "Blanc": "#3E2723",
+    "":      "#616161",
+}
+
+# Catalogue produits proposé dans la colonne « Produit » du tableau de saisie
+PRODUITS_CATALOGUE = ["WC chimique", "WC handicapé", "WC Luxe",
+                      "Lave-main", "Urinoir", "WC client"]
+
+# Matériel appartenant au client : jamais décompté du stock Deldossi
+PRODUITS_HORS_STOCK = {"WC client"}
+
+# Référentiel des articles gérés en stock (ordre d'affichage)
+ARTICLES_STOCK = [
+    "WC chimique + Lave-main",
+    "WC chimique + Urinoir",
+    "WC chimique",
+    "WC handicapé",
+    "WC Luxe",
+    "Lave-main",
+    "Urinoir",
+]
+
+STOCK_COLUMNS = ["Article", "Couleur", "Installés", "En stock"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mouvements de stock par action
+# ─────────────────────────────────────────────────────────────────────────────
+# −1 : l'unité quitte le dépôt (sortie de stock, entrée en parc installé)
+# +1 : l'unité revient au dépôt (entrée en stock, sortie du parc installé)
+#  0 : neutre (intervention sur place, aucun mouvement)
+#
+# HYPOTHÈSE À VALIDER : « Chargement » et « Déchargement » sont considérés comme
+# neutres par défaut, car ils décrivent des manutentions dont le sens n'est pas
+# univoque. Un interrupteur dans l'onglet Stock permet de les traiter comme des
+# mouvements réels (Chargement = retour dépôt, Déchargement = dépose sur site).
+# ─────────────────────────────────────────────────────────────────────────────
+
+ACTION_MOUVEMENT_STOCK = {
+    "Déposer":      -1,
+    "Retirer":      +1,
+    "Nettoyer":      0,
+    "Chargement":    0,
+    "Déchargement":  0,
+}
+ACTION_MOUVEMENT_STOCK_ETENDU = {
+    "Déposer":      -1,
+    "Retirer":      +1,
+    "Nettoyer":      0,
+    "Chargement":   +1,   # matériel récupéré et ramené au dépôt
+    "Déchargement": -1,   # matériel déposé sur site
+}
+
+
+def _norm_txt(s) -> str:
+    """Normalise une chaîne : minuscules, sans accents, espaces compactés."""
+    s = str(s if s is not None else "").strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return " ".join(s.split())
+
+
+def _article_key(produit, option="") -> str:
+    """Construit la référence article à partir du couple Produit / Option.
+
+    Ex. ('WC chimique', 'Lave-main') → 'WC chimique + Lave-main'
+        ('Urinoir', '')              → 'Urinoir'
+    Retourne '' pour les produits hors stock (WC client) ou produit vide.
+    """
+    p = str(produit or "").strip()
+    o = str(option or "").strip()
+    if not p or p in PRODUITS_HORS_STOCK:
+        return ""
+    if p == "WC chimique" and o:
+        return f"WC chimique + {o}"
+    return p
+
+
+def normalize_article(label) -> str:
+    """Reconnaît une référence article écrite librement (mail, Excel exploitant).
+
+    Tolère les variantes rencontrées sur le terrain :
+        'WC lave main', 'WL PMR', 'Laves mains', 'Urinoirs', '2 WC Luxe'…
+    Retourne la référence canonique, ou le libellé nettoyé si non reconnu.
+    """
+    raw = str(label or "").strip()
+    n = _norm_txt(raw)
+    if not n:
+        return ""
+    # Retire un éventuel préfixe numérique ("2 WC Luxe" → "wc luxe")
+    n = _re_stock.sub(r"^\d+\s*[x×]?\s*", "", n)
+
+    has_wc = bool(_re_stock.search(r"\bw[cl]\b", n))  # 'WL' = coquille fréquente pour 'WC'
+    if "pmr" in n or "handicap" in n:
+        return "WC handicapé"
+    if "luxe" in n:
+        return "WC Luxe"
+    if has_wc and "lave" in n:
+        return "WC chimique + Lave-main"
+    if has_wc and "urinoir" in n:
+        return "WC chimique + Urinoir"
+    if "lave" in n and "main" in n:
+        return "Lave-main"
+    if "urinoir" in n:
+        return "Urinoir"
+    if has_wc:
+        return "WC chimique"
+    return raw
+
+
+def normalize_couleur(label) -> str:
+    """Reconnaît une couleur écrite librement ('Jaunes', 'creme', 'VERT')."""
+    n = _norm_txt(label)
+    if not n:
+        return ""
+    for c in COULEURS_PRODUITS:
+        cn = _norm_txt(c)
+        if n == cn or n == cn + "s" or n.startswith(cn):
+            return c
+    return str(label).strip().capitalize()
+
+
+def _stock_default_df() -> pd.DataFrame:
+    """Parc initial issu du relevé transmis par l'exploitation.
+
+    Source : mail exploitation (WC installés / WC en stock). Ces valeurs servent
+    d'amorce et sont écrasées dès qu'un fichier Excel de stock est importé.
+    """
+    rows = [
+        # Article,                    Couleur,  Installés, En stock
+        ("WC chimique + Lave-main",   "Vert",     3, 1),
+        ("WC chimique + Lave-main",   "Jaune",    1, 4),
+        ("WC chimique + Lave-main",   "Rose",     3, 1),
+        ("WC chimique + Lave-main",   "Bleu",     1, 3),
+        ("WC chimique + Lave-main",   "Orange",   0, 1),
+        ("WC chimique + Urinoir",     "Jaune",    0, 2),
+        ("WC chimique + Urinoir",     "Orange",   0, 2),
+        ("WC handicapé",              "Vert",     0, 1),
+        ("WC Luxe",                   "Crème",    0, 2),
+        ("Lave-main",                 "Jaune",    0, 5),
+        ("Urinoir",                   "Vert",     0, 4),
+    ]
+    return pd.DataFrame(rows, columns=STOCK_COLUMNS)
+
+
+def _clean_stock_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Nettoie, normalise et agrège un tableau de stock.
+
+    - Complète les colonnes manquantes
+    - Normalise articles et couleurs
+    - Convertit les quantités en entiers ≥ 0
+    - Agrège les doublons (Article, Couleur)
+    - Trie selon l'ordre du référentiel ARTICLES_STOCK
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=STOCK_COLUMNS)
+    out = df.copy()
+    for col in STOCK_COLUMNS:
+        if col not in out.columns:
+            out[col] = "" if col in ("Article", "Couleur") else 0
+    out = out[STOCK_COLUMNS]
+    out["Article"] = out["Article"].map(normalize_article)
+    out["Couleur"] = out["Couleur"].map(normalize_couleur)
+    for col in ("Installés", "En stock"):
+        out[col] = (pd.to_numeric(out[col], errors="coerce")
+                    .fillna(0).clip(lower=0).astype(int))
+    out = out[out["Article"].astype(str).str.strip() != ""]
+    out = (out.groupby(["Article", "Couleur"], as_index=False)[["Installés", "En stock"]]
+              .sum())
+    ordre = {a: i for i, a in enumerate(ARTICLES_STOCK)}
+    ordre_c = {c: i for i, c in enumerate(COULEURS_PRODUITS)}
+    out["_o"] = out["Article"].map(lambda a: ordre.get(a, 999))
+    out["_c"] = out["Couleur"].map(lambda c: ordre_c.get(c, 999))
+    out = (out.sort_values(["_o", "Article", "_c", "Couleur"])
+              .drop(columns=["_o", "_c"]).reset_index(drop=True))
+    return out
+
+
+def parse_stock_excel(uploaded_file):
+    """Lit un fichier Excel de stock et retourne (DataFrame | None, message).
+
+    Détection tolérante :
+    - onglet contenant 'stock' ou 'parc' (sinon premier onglet)
+    - colonnes reconnues par mots-clés, quelle que soit la casse ou l'accentuation
+    """
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+    except Exception as e:
+        return None, f"Fichier illisible : {e}"
+
+    sheet = None
+    for s in xls.sheet_names:
+        ns = _norm_txt(s)
+        if "stock" in ns or "parc" in ns:
+            sheet = s
+            break
+    sheet = sheet or xls.sheet_names[0]
+
+    # Lecture brute : la ligne d'en-tête n'est pas nécessairement la première
+    # (les classeurs exportés par l'application comportent un titre et une date).
+    try:
+        brut = xls.parse(sheet, header=None)
+    except Exception as e:
+        return None, f"Onglet « {sheet} » illisible : {e}"
+
+    if brut is None or len(brut) == 0:
+        return None, f"L'onglet « {sheet} » est vide."
+
+    def _role_colonne(valeur):
+        """Identifie le rôle d'un libellé de colonne, ou None."""
+        n = _norm_txt(valeur)
+        if not n:
+            return None
+        if "article" in n or "produit" in n or "reference" in n or "designation" in n:
+            return "Article"
+        if "couleur" in n or "coloris" in n:
+            return "Couleur"
+        if "install" in n or "pose" in n or "chez le client" in n or "parc client" in n:
+            return "Installés"
+        if "stock" in n or "dispo" in n or "depot" in n:
+            return "En stock"
+        return None
+
+    # Recherche de la ligne d'en-tête dans les 15 premières lignes
+    header_row, mapping = None, {}
+    for i in range(min(15, len(brut))):
+        candidat = {}
+        for j, val in enumerate(brut.iloc[i]):
+            role = _role_colonne(val)
+            if role and role not in candidat:
+                candidat[role] = j
+        if "Article" in candidat and ("Installés" in candidat or "En stock" in candidat):
+            header_row, mapping = i, candidat
+            break
+
+    if header_row is None:
+        apercu = ", ".join(str(v) for v in brut.iloc[0].tolist()[:6])
+        return None, (
+            f"En-tête introuvable dans l'onglet « {sheet} ». Le fichier doit "
+            f"comporter une ligne d'en-tête avec au minimum une colonne "
+            f"« Article » et une colonne « Installés » ou « En stock ». "
+            f"Première ligne lue : {apercu}"
+        )
+
+    corps = brut.iloc[header_row + 1:]
+    n_lignes = len(corps)
+
+    def _col(role, defaut):
+        return corps.iloc[:, mapping[role]] if role in mapping else pd.Series(
+            [defaut] * n_lignes, index=corps.index)
+
+    df = pd.DataFrame({
+        "Article":   _col("Article",   ""),
+        "Couleur":   _col("Couleur",   ""),
+        "Installés": _col("Installés", 0),
+        "En stock":  _col("En stock",  0),
+    })
+
+    # Écarte les lignes de synthèse et les notes de bas de tableau
+    _exclus = {"total", "totaux", "total general", "somme", "note", "nan"}
+    df = df[~df["Article"].map(lambda v: _norm_txt(v) in _exclus
+                               or _norm_txt(v).startswith("note :"))]
+
+    df = _clean_stock_df(df)
+    if len(df) == 0:
+        return None, f"Aucune ligne exploitable dans l'onglet « {sheet} »."
+    return df, f"{len(df)} référence(s) importée(s) depuis l'onglet « {sheet} »."
+
+
+def export_stock_excel(df_stock: pd.DataFrame, df_projete: pd.DataFrame | None = None,
+                       maj_date=None) -> BytesIO:
+    """Génère le classeur Excel du parc (onglet 'Stock' réimportable).
+
+    - Onglet « Stock »          : état courant, colonnes attendues à la réimport
+    - Onglet « Synthèse »       : matrice Article × Couleur (stock disponible)
+    - Onglet « Stock projeté »  : état après exécution de la tournée (optionnel)
+    """
+    wb = openpyxl.Workbook()
+    hdr_fill = PatternFill("solid", fgColor="1F4E79")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    bold_f   = Font(bold=True)
+    center   = Alignment(horizontal="center", vertical="center")
+    left     = Alignment(horizontal="left", vertical="center")
+    thin     = Side(style="thin", color="CCCCCC")
+    brd      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    warn_fill = PatternFill("solid", fgColor="F8D7DA")
+    low_fill  = PatternFill("solid", fgColor="FFF3CD")
+
+    def _write_table(ws, df, titre):
+        ws.append([titre])
+        tr = ws.max_row
+        ws.merge_cells(f"A{tr}:E{tr}")
+        c = ws.cell(tr, 1)
+        c.font = Font(bold=True, size=14, color="1F4E79")
+        c.alignment = center
+        ws.row_dimensions[tr].height = 26
+        if maj_date:
+            ws.append([f"État au {maj_date}"])
+            ws.merge_cells(f"A{ws.max_row}:E{ws.max_row}")
+            ws.cell(ws.max_row, 1).font = Font(italic=True, size=9, color="666666")
+        ws.append([])
+        headers = STOCK_COLUMNS + ["Parc total"]
+        ws.append(headers)
+        hr = ws.max_row
+        for col, h in enumerate(headers, 1):
+            cc = ws.cell(hr, col)
+            cc.fill = hdr_fill; cc.font = hdr_font
+            cc.alignment = center; cc.border = brd
+        ws.row_dimensions[hr].height = 20
+        for _, row in df.iterrows():
+            ws.append([row["Article"], row["Couleur"],
+                       int(row["Installés"]), int(row["En stock"]),
+                       int(row["Installés"]) + int(row["En stock"])])
+            r = ws.max_row
+            for col in range(1, 6):
+                cc = ws.cell(r, col)
+                cc.border = brd
+                cc.alignment = left if col <= 2 else center
+            if int(row["En stock"]) == 0:
+                ws.cell(r, 4).fill = warn_fill
+                ws.cell(r, 4).font = Font(bold=True, color="B00020")
+            elif int(row["En stock"]) <= 1:
+                ws.cell(r, 4).fill = low_fill
+        # Ligne de total
+        ws.append(["TOTAL", "", int(df["Installés"].sum()), int(df["En stock"].sum()),
+                   int(df["Installés"].sum() + df["En stock"].sum())])
+        r = ws.max_row
+        for col in range(1, 6):
+            cc = ws.cell(r, col)
+            cc.font = bold_f; cc.border = brd
+            cc.fill = PatternFill("solid", fgColor="DCE6F1")
+            cc.alignment = left if col <= 2 else center
+        for col, w in zip(range(1, 6), [30, 14, 12, 12, 12]):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
+
+    ws = wb.active
+    ws.title = "Stock"
+    _write_table(ws, df_stock, "PARC & STOCK – DELDOSSI ASSAINISSEMENT")
+
+    # ── Onglet synthèse : matrice Article × Couleur ──
+    ws2 = wb.create_sheet("Synthèse")
+    couleurs = [c for c in COULEURS_PRODUITS
+                if c in set(df_stock["Couleur"].astype(str))] or [""]
+    ws2.append(["MATRICE STOCK DISPONIBLE – ARTICLE × COULEUR"])
+    ws2.merge_cells(start_row=1, start_column=1,
+                    end_row=1, end_column=max(2, len(couleurs) + 2))
+    ws2.cell(1, 1).font = Font(bold=True, size=14, color="1F4E79")
+    ws2.cell(1, 1).alignment = center
+    ws2.append([])
+    ws2.append(["Article"] + couleurs + ["Total"])
+    hr = ws2.max_row
+    for col in range(1, len(couleurs) + 3):
+        cc = ws2.cell(hr, col)
+        cc.fill = hdr_fill; cc.font = hdr_font
+        cc.alignment = center; cc.border = brd
+    for art in [a for a in ARTICLES_STOCK if a in set(df_stock["Article"])]:
+        sub = df_stock[df_stock["Article"] == art]
+        vals = []
+        for c in couleurs:
+            v = sub[sub["Couleur"] == c]["En stock"].sum()
+            vals.append(int(v))
+        ws2.append([art] + vals + [int(sum(vals))])
+        r = ws2.max_row
+        for col in range(1, len(couleurs) + 3):
+            cc = ws2.cell(r, col)
+            cc.border = brd
+            cc.alignment = left if col == 1 else center
+            if col > 1 and col <= len(couleurs) + 1 and cc.value == 0:
+                cc.font = Font(color="BBBBBB")
+    ws2.column_dimensions["A"].width = 30
+    for col in range(2, len(couleurs) + 3):
+        ws2.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 12
+
+    # ── Onglet stock projeté (après tournée) ──
+    if df_projete is not None and len(df_projete) > 0:
+        ws3 = wb.create_sheet("Stock projeté")
+        _write_table(ws3, df_projete, "PARC & STOCK PROJETÉ APRÈS TOURNÉE")
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def besoins_tournee(df_stops: pd.DataFrame, inclure_manutentions: bool = False) -> pd.DataFrame:
+    """Calcule les mouvements de stock générés par les arrêts saisis.
+
+    Retourne un DataFrame : Article | Couleur | Sorties | Retours | Net
+      - Sorties : unités qui quittent le dépôt (à prélever en stock)
+      - Retours : unités qui reviennent au dépôt (à réintégrer en stock)
+      - Net     : Retours − Sorties (variation prévisionnelle du stock)
+    Les lignes sans adresse et les produits hors stock (WC client) sont ignorés.
+    """
+    cols = ["Article", "Couleur", "Sorties", "Retours", "Net"]
+    if df_stops is None or len(df_stops) == 0:
+        return pd.DataFrame(columns=cols)
+
+    bareme = ACTION_MOUVEMENT_STOCK_ETENDU if inclure_manutentions else ACTION_MOUVEMENT_STOCK
+    agg = {}
+    for _, row in df_stops.iterrows():
+        if str(row.get("Adresse", "") or "").strip() == "":
+            continue
+        art = _article_key(row.get("Produit", ""), row.get("Option", ""))
+        if not art:
+            continue
+        sens = bareme.get(str(row.get("Action", "")).strip(), 0)
+        if sens == 0:
+            continue
+        try:
+            qty = max(1, int(float(row.get("Quantité", 1) or 1)))
+        except (ValueError, TypeError):
+            qty = 1
+        couleur = normalize_couleur(row.get("Couleur", ""))
+        key = (art, couleur)
+        cur = agg.setdefault(key, {"Sorties": 0, "Retours": 0})
+        if sens < 0:
+            cur["Sorties"] += qty
+        else:
+            cur["Retours"] += qty
+
+    if not agg:
+        return pd.DataFrame(columns=cols)
+
+    rows = [{"Article": a, "Couleur": c,
+             "Sorties": v["Sorties"], "Retours": v["Retours"],
+             "Net": v["Retours"] - v["Sorties"]}
+            for (a, c), v in agg.items()]
+    df = pd.DataFrame(rows, columns=cols)
+    ordre = {a: i for i, a in enumerate(ARTICLES_STOCK)}
+    ordre_c = {c: i for i, c in enumerate(COULEURS_PRODUITS)}
+    df["_o"] = df["Article"].map(lambda a: ordre.get(a, 999))
+    df["_c"] = df["Couleur"].map(lambda c: ordre_c.get(c, 999))
+    return (df.sort_values(["_o", "Article", "_c", "Couleur"])
+              .drop(columns=["_o", "_c"]).reset_index(drop=True))
+
+
+def controle_disponibilite(df_stock: pd.DataFrame, df_besoins: pd.DataFrame) -> pd.DataFrame:
+    """Confronte les besoins de la tournée au stock disponible.
+
+    Retourne un DataFrame : Article | Couleur | Besoin | Disponible | Manque | Statut
+    Règle couleur : si la couleur n'est pas renseignée (choix laissé au client),
+    le besoin est confronté au stock **toutes couleurs confondues** de l'article.
+    """
+    cols = ["Article", "Couleur", "Besoin", "Disponible", "Manque", "Statut"]
+    if df_besoins is None or len(df_besoins) == 0:
+        return pd.DataFrame(columns=cols)
+
+    stock = _clean_stock_df(df_stock)
+    rows = []
+    for _, b in df_besoins.iterrows():
+        besoin = int(b["Sorties"])
+        if besoin <= 0:
+            continue
+        art, coul = b["Article"], b["Couleur"]
+        if coul:
+            dispo = int(stock[(stock["Article"] == art) &
+                              (stock["Couleur"] == coul)]["En stock"].sum())
+            libelle_coul = coul
+        else:
+            dispo = int(stock[stock["Article"] == art]["En stock"].sum())
+            libelle_coul = "Toutes couleurs"
+        manque = max(0, besoin - dispo)
+        if manque > 0:
+            statut = "🔴 Rupture"
+        elif dispo - besoin == 0:
+            statut = "🟠 Juste suffisant"
+        else:
+            statut = "🟢 Disponible"
+        rows.append({"Article": art, "Couleur": libelle_coul, "Besoin": besoin,
+                     "Disponible": dispo, "Manque": manque, "Statut": statut})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def projeter_stock(df_stock: pd.DataFrame, df_besoins: pd.DataFrame) -> pd.DataFrame:
+    """Applique les mouvements de la tournée au parc et retourne l'état projeté.
+
+    Les besoins sans couleur sont imputés sur la couleur la mieux dotée
+    (allocation gloutonne), afin de rester cohérent avec la réalité terrain.
+    """
+    stock = _clean_stock_df(df_stock)
+    if df_besoins is None or len(df_besoins) == 0:
+        return stock
+
+    def _idx(art, coul):
+        m = stock.index[(stock["Article"] == art) & (stock["Couleur"] == coul)]
+        return m[0] if len(m) else None
+
+    for _, b in df_besoins.iterrows():
+        art, coul = b["Article"], b["Couleur"]
+        for qte, sens in ((int(b["Sorties"]), -1), (int(b["Retours"]), +1)):
+            if qte <= 0:
+                continue
+            if coul:
+                cibles = [(coul, qte)]
+            else:
+                # Allocation gloutonne : on sert d'abord la couleur la mieux dotée
+                sub = stock[stock["Article"] == art].sort_values(
+                    "En stock", ascending=(sens > 0))
+                cibles, reste = [], qte
+                for _, l in sub.iterrows():
+                    if reste <= 0:
+                        break
+                    part = min(reste, int(l["En stock"])) if sens < 0 else reste
+                    part = max(part, 0)
+                    if part > 0:
+                        cibles.append((l["Couleur"], part))
+                        reste -= part
+                if reste > 0:
+                    cibles.append((sub.iloc[0]["Couleur"] if len(sub) else "", reste))
+            for c, part in cibles:
+                i = _idx(art, c)
+                if i is None:
+                    stock = pd.concat([stock, pd.DataFrame(
+                        [{"Article": art, "Couleur": c, "Installés": 0, "En stock": 0}]
+                    )], ignore_index=True)
+                    i = _idx(art, c)
+                stock.at[i, "En stock"]  = max(0, int(stock.at[i, "En stock"]) + sens * part)
+                stock.at[i, "Installés"] = max(0, int(stock.at[i, "Installés"]) - sens * part)
+    return _clean_stock_df(stock)
+
+
+def _besoins_records_pour_export(df_stops, df_stock, inclure_manutentions=False) -> list:
+    """Prépare la liste de dicts des mouvements matériel, enrichie du stock avant
+    tournée et de l'éventuel manque, pour alimenter les exports Excel et PDF."""
+    bes = besoins_tournee(df_stops, inclure_manutentions=inclure_manutentions)
+    if len(bes) == 0:
+        return []
+    stock = _clean_stock_df(df_stock)
+    records = []
+    for _, b in bes.iterrows():
+        art, coul = b["Article"], b["Couleur"]
+        if coul:
+            dispo = int(stock[(stock["Article"] == art) &
+                              (stock["Couleur"] == coul)]["En stock"].sum())
+            lbl_dispo = f"{dispo} ({coul})"
+        else:
+            dispo = int(stock[stock["Article"] == art]["En stock"].sum())
+            lbl_dispo = f"{dispo} (toutes couleurs)"
+        records.append({
+            "Article":    art,
+            "Couleur":    coul,
+            "Sorties":    int(b["Sorties"]),
+            "Retours":    int(b["Retours"]),
+            "Net":        int(b["Net"]),
+            "StockAvant": lbl_dispo,
+            "Manque":     max(0, int(b["Sorties"]) - dispo),
+        })
+    return records
+
+
+def _pastille_couleur(couleur, texte=None, taille="0.78em") -> str:
+    """Retourne le HTML d'une pastille colorée (badge) pour une couleur produit."""
+    coul = str(couleur or "").strip()
+    bg   = COULEUR_HEX.get(coul, "#E0E0E0")
+    fg   = COULEUR_TEXTE.get(coul, "#FFFFFF")
+    lbl  = texte if texte is not None else (coul or "Non spécifiée")
+    bord = ";border:1px solid #BDBDBD" if coul in ("Blanc", "Crème", "") else ""
+    return (f'<span style="background:{bg};color:{fg};padding:1px 8px;'
+            f'border-radius:10px;font-size:{taille};white-space:nowrap{bord}">'
+            f'{lbl}</span>')
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NOMENCLATURE DES PIÈCES À CONTRÔLER (état des lieux WC chimique)
 # Regroupées par zone d'inspection physique pour un contrôle méthodique.
@@ -246,7 +838,10 @@ def _etat_lieux_prestation_parts(stop):
         q = 1
     produit = str(stop.get("produit", "") or "").strip()
     option  = str(stop.get("option", "") or "").strip()
+    couleur = str(stop.get("couleur", "") or "").strip()
     produit_label = f"{q} × {produit}" if produit else "—"
+    if produit and couleur:
+        produit_label += f"  (couleur : {couleur})"
     option_label  = f"{q} × {option}"  if option  else "—"
     return produit_label, option_label
 
@@ -325,6 +920,7 @@ def _init_df():
         "Action":        ["Nettoyer",    "Nettoyer",    "Nettoyer"],
         "Produit":       ["WC chimique", "WC chimique", "WC chimique"],
         "Option":        ["Lave-main",   "Lave-main",   "Lave-main"],
+        "Couleur":       ["",            "",            ""],
         "Quantité":      [1,             1,             1],
         "Nom du client": ["",            "",            ""],
         "Adresse":       ["",            "",            ""],
@@ -346,6 +942,19 @@ if "pause_dejeuner"    not in st.session_state: st.session_state.pause_dejeuner 
 if "etat_lieux_par_arret" not in st.session_state: st.session_state.etat_lieux_par_arret = True
 if "manual_order"      not in st.session_state: st.session_state.manual_order      = None
 if "manual_result"     not in st.session_state: st.session_state.manual_result     = None
+
+# ── Parc & stocks ────────────────────────────────────────────────────────────
+# df_stock          : état courant du parc (Article / Couleur / Installés / En stock)
+# stock_source      : origine des données affichée à l'utilisateur
+# stock_import_ok   : True si un fichier Excel a été importé dans cette session
+# stock_manutentions: prise en compte de Chargement/Déchargement dans les mouvements
+if "df_stock"           not in st.session_state: st.session_state.df_stock           = _stock_default_df()
+if "stock_source"       not in st.session_state: st.session_state.stock_source       = "Valeurs de référence (relevé exploitation)"
+if "stock_import_ok"    not in st.session_state: st.session_state.stock_import_ok    = False
+if "stock_import_name"  not in st.session_state: st.session_state.stock_import_name  = None
+if "stock_manutentions" not in st.session_state: st.session_state.stock_manutentions = False
+if "stock_seuil_alerte" not in st.session_state: st.session_state.stock_seuil_alerte = 1
+if "stock_last_file_id" not in st.session_state: st.session_state.stock_last_file_id = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCODAGE – API Adresse gouv.fr + fallback Nominatim
@@ -520,6 +1129,7 @@ def _qty_label(row):
     """
     produit = str(row.get("Produit", "") or "").strip()
     option  = str(row.get("Option",  "") or "").strip()
+    couleur = str(row.get("Couleur", "") or "").strip()
     try:
         qty = int(row.get("Quantité", 1) or 1)
     except (ValueError, TypeError):
@@ -532,6 +1142,9 @@ def _qty_label(row):
     # Option uniquement pour WC chimique et si renseignée
     if produit == "WC chimique" and option:
         label += f" + {qty} × {option}"
+    # Couleur exigée par le client (critère facultatif)
+    if couleur:
+        label += f" — couleur {couleur}"
     return label
 
 def _compute_arrivals(tour, matrix, depart_min, time_windows, pause_after_idx=None):
@@ -1549,7 +2162,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         "Déchargement": PatternFill("solid", fgColor="FFE0B2"),
     }
 
-    ws.merge_cells("A1:N1")
+    ws.merge_cells("A1:O1")
     c = ws["A1"]
     c.value     = f"FEUILLE DE TOURNÉE – {tour_date.strftime('%d/%m/%Y')}"
     c.font      = Font(bold=True, size=15, color="1F4E79")
@@ -1570,11 +2183,11 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
         ws.cell(r, 1).value = label + " :"
         ws.cell(r, 1).font  = bold_f
         ws.cell(r, 2).value = val
-        ws.merge_cells(f"B{r}:N{r}")
+        ws.merge_cells(f"B{r}:O{r}")
         ws.cell(r, 2).alignment = left
     ws.append([])
 
-    headers = ["Ordre", "Action", "Produit", "Option", "Qté", "Nom du client", "Adresse", "Durée (min)", "Pas avant", "Pas après", "Arrivée", "Départ", "Observations", "✓ Fait"]
+    headers = ["Ordre", "Action", "Produit", "Option", "Couleur", "Qté", "Nom du client", "Adresse", "Durée (min)", "Pas avant", "Pas après", "Arrivée", "Départ", "Observations", "✓ Fait"]
     ws.append(headers)
     hr = ws.max_row
     for col, h in enumerate(headers, 1):
@@ -1590,6 +2203,7 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
     for si, stop in enumerate(result["stops_ordered"]):
         ws.append([stop["order_num"], stop["action"],
                    stop.get("produit", ""), stop.get("option", ""),
+                   stop.get("couleur", "") or "—",
                    stop.get("qty_num", ""),
                    stop["client"] or "", stop["address"],
                    stop.get("duration_min", ""),
@@ -1600,12 +2214,15 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
                    stop.get("observations", "") or "",
                    ""])
         r = ws.max_row
-        for col in range(1, 15):
+        for col in range(1, 16):
             c = ws.cell(r, col)
             c.border = brd
-            c.alignment = center if col not in (7, 13) else left
-            if col == 11 and stop.get("violated"):
+            c.alignment = center if col not in (8, 14) else left
+            if col == 12 and stop.get("violated"):
                 c.font = Font(bold=True, color="DC3545")
+        # Mise en évidence de la couleur exigée par le client
+        if stop.get("couleur"):
+            ws.cell(r, 5).font = Font(bold=True, color="1F4E79")
         ws.cell(r, 2).fill = action_fills.get(stop["action"],
                                                PatternFill("solid", fgColor="F0F0F0"))
         ws.row_dimensions[r].height = 18
@@ -1615,30 +2232,73 @@ def export_excel(result, tour_date, driver_name, fuel_price_per_l):
             _ps, _pe = _pause_slot(result["stops_ordered"], pause_idx)
             slot_txt = f"{_ps} – {_pe}" if _ps else f"{PAUSE_DEJEUNER_MIN} min"
             ws.append(["", f"🍽️ PAUSE DÉJEUNER — {PAUSE_DEJEUNER_MIN} min",
-                        "", "", "", "", "",
+                        "", "", "", "", "", "",
                         PAUSE_DEJEUNER_MIN,
                         "", "", _ps, _pe,
                         f"Créneau : {slot_txt}", ""])
             pr = ws.max_row
             ws.merge_cells(f"B{pr}:G{pr}")
-            for col in range(1, 15):
+            for col in range(1, 16):
                 c = ws.cell(pr, col)
                 c.fill   = pause_fill
                 c.font   = pause_font
                 c.border = brd
-                c.alignment = center if col not in (13,) else left
+                c.alignment = center if col not in (14,) else left
             ws.row_dimensions[pr].height = 18
 
-    ws.append(["↩", "Retour dépôt", "", "", "", "", result.get("depot_retour_addr",""), "", "", "", "", "", "", ""])
+    ws.append(["↩", "Retour dépôt", "", "", "", "", "", result.get("depot_retour_addr",""), "", "", "", "", "", "", ""])
     r = ws.max_row
-    for col in range(1, 15):
+    for col in range(1, 16):
         c = ws.cell(r, col)
         c.fill = PatternFill("solid", fgColor="FFF3CD")
         c.font = bold_f; c.border = brd
-        c.alignment = center if col not in (7, 13) else left
+        c.alignment = center if col not in (8, 14) else left
 
-    for col, width in zip(range(1, 15), [8, 14, 16, 14, 6, 22, 44, 12, 12, 12, 12, 12, 30, 8]):
+    for col, width in zip(range(1, 16), [8, 14, 16, 14, 10, 6, 22, 44, 12, 12, 12, 12, 12, 30, 8]):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
+
+    # ── Feuille « Récap matériel » : ce qu'il faut charger / rapporter ──
+    besoins_rec = result.get("besoins_records") or []
+    if besoins_rec:
+        wsm = wb.create_sheet("Récap matériel")
+        wsm.append([f"RÉCAP MATÉRIEL – TOURNÉE DU {tour_date.strftime('%d/%m/%Y')}"])
+        wsm.merge_cells("A1:F1")
+        wsm.cell(1, 1).font = Font(bold=True, size=14, color="1F4E79")
+        wsm.cell(1, 1).alignment = center
+        wsm.row_dimensions[1].height = 26
+        wsm.append([])
+        mh = ["Article", "Couleur", "À charger au dépôt", "À rapporter au dépôt",
+              "Variation nette", "Stock avant tournée"]
+        wsm.append(mh)
+        hr2 = wsm.max_row
+        for col, h in enumerate(mh, 1):
+            cc = wsm.cell(hr2, col)
+            cc.fill = hdr_fill; cc.font = hdr_font
+            cc.alignment = center; cc.border = brd
+        wsm.row_dimensions[hr2].height = 22
+        for b in besoins_rec:
+            wsm.append([b.get("Article", ""), b.get("Couleur", "") or "Indifférente",
+                        int(b.get("Sorties", 0)), int(b.get("Retours", 0)),
+                        int(b.get("Net", 0)), b.get("StockAvant", "")])
+            rr = wsm.max_row
+            for col in range(1, 7):
+                cc = wsm.cell(rr, col)
+                cc.border = brd
+                cc.alignment = left if col <= 2 else center
+            if b.get("Manque", 0):
+                for col in range(1, 7):
+                    wsm.cell(rr, col).fill = PatternFill("solid", fgColor="F8D7DA")
+                wsm.cell(rr, 3).font = Font(bold=True, color="B00020")
+        for col, w in zip(range(1, 7), [30, 16, 20, 22, 16, 20]):
+            wsm.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
+        wsm.append([])
+        wsm.append(["Note : « À charger » correspond aux actions Déposer "
+                    "(et Déchargement si les manutentions sont comptabilisées). "
+                    "« À rapporter » correspond aux actions Retirer."])
+        wsm.merge_cells(start_row=wsm.max_row, start_column=1,
+                        end_row=wsm.max_row, end_column=6)
+        wsm.cell(wsm.max_row, 1).font = Font(italic=True, size=9, color="666666")
+        wsm.cell(wsm.max_row, 1).alignment = Alignment(wrap_text=True, vertical="top")
 
     # ── Feuille « État des lieux » (une par arrêt ou une fiche généraliste) ──
     add_etat_lieux_sheet(
@@ -1746,7 +2406,7 @@ def export_pdf(result, tour_date, driver_name):
                                 fontSize=8, fontName="Helvetica-Bold",
                                 textColor=colors.white, alignment=1)
     table_data = [[P(h, hdr_style) for h in
-                   ["N°", "Action", "Produit", "Option", "Qté",
+                   ["N°", "Action", "Produit", "Option", "Coul.", "Qté",
                     "Client", "Adresse", "Durée", "Pav.", "Pap.", "Arr.", "Dép.", "Obs."]]]
     row_styles = []
 
@@ -1755,7 +2415,7 @@ def export_pdf(result, tour_date, driver_name):
 
     # Ligne dépôt départ
     table_data.append([
-        P(""), P("🏭 Dépôt départ", depot_row_style), P(""), P(""), P(""),
+        P(""), P("🏭 Dépôt départ", depot_row_style), P(""), P(""), P(""), P(""),
         P(""), P(result.get("depot_depart_addr",""), depot_row_style),
         P(""), P(""), P(""),
         P(_fmt_min(result.get("depart_min")) or "", depot_row_style), P(""), P("")
@@ -1776,11 +2436,18 @@ def export_pdf(result, tour_date, driver_name):
                                             fontSize=8, leading=10,
                                             fontName="Helvetica-Bold",
                                             textColor=colors.HexColor("#1F4E79"))
+        couleur_stop = stop.get("couleur", "") or ""
+        couleur_style = (ParagraphStyle(f"coul_{i}", parent=styles["Normal"],
+                                        fontSize=8, leading=10,
+                                        fontName="Helvetica-Bold",
+                                        textColor=colors.HexColor("#1F4E79"))
+                         if couleur_stop else cell_style)
         table_data.append([
             P(str(stop["order_num"])),
             P(stop["action"], action_para_style),
             P(stop.get("produit", "")),
             P(stop.get("option", "")),
+            P(couleur_stop or "—", couleur_style),
             P(str(stop.get("qty_num", ""))),
             P(stop["client"] or ""),
             P(stop["address"]),
@@ -1806,7 +2473,7 @@ def export_pdf(result, tour_date, driver_name):
             table_data.append([
                 P(""),
                 P(f"🍽️ Pause déjeuner", pause_style),
-                P(""), P(""), P(""), P(""), P(""),
+                P(""), P(""), P(""), P(""), P(""), P(""),
                 P(str(PAUSE_DEJEUNER_MIN), pause_style),
                 P(""), P(""),
                 P(_ps, pause_style),
@@ -1823,7 +2490,7 @@ def export_pdf(result, tour_date, driver_name):
 
     # Ligne dépôt retour
     table_data.append([
-        P(""), P("🏁 Dépôt retour", depot_row_style), P(""), P(""), P(""),
+        P(""), P("🏁 Dépôt retour", depot_row_style), P(""), P(""), P(""), P(""),
         P(""), P(result.get("depot_retour_addr",""), depot_row_style),
         P(""), P(""), P(""), P(""),
         P(_fmt_min(result.get("return_min")) or "", depot_row_style), P("")
@@ -1832,17 +2499,18 @@ def export_pdf(result, tour_date, driver_name):
     row_styles += [("BACKGROUND", (0, last), (-1, last), colors.HexColor("#FFF3CD"))]
 
     # Largeur utile A4 avec marges 8mm : 194mm
-    # N°=7, Action=25, Produit=23, Option=17, Qté=7, Client=16, Adresse=30,
-    # Durée=9, Pav.=10, Pap.=10, Arr.=10, Dép.=10, Obs.=20  → total=194mm
-    CW = [7*mm, 25*mm, 23*mm, 17*mm, 7*mm, 16*mm, 30*mm, 9*mm, 10*mm, 10*mm, 10*mm, 10*mm, 20*mm]
+    # N°=7, Action=21, Produit=20, Option=14, Coul.=14, Qté=7, Client=16,
+    # Adresse=28, Durée=9, Pav.=10, Pap.=10, Arr.=10, Dép.=10, Obs.=18 → 194mm
+    CW = [7*mm, 21*mm, 20*mm, 14*mm, 14*mm, 7*mm, 16*mm, 28*mm,
+          9*mm, 10*mm, 10*mm, 10*mm, 10*mm, 18*mm]
     stops_table = Table(table_data, colWidths=CW, repeatRows=1)
     base_style = [
         ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-        ("ALIGN",         (6, 1), (6, -1), "LEFT"),
+        ("ALIGN",         (7, 1), (7, -1), "LEFT"),
         ("ALIGN",         (1, 1), (3, -1), "LEFT"),
-        ("ALIGN",         (12, 1), (12, -1), "LEFT"),
-        ("NOSPLIT",        (1, 1), (3, -1)),
+        ("ALIGN",         (13, 1), (13, -1), "LEFT"),
+        ("NOSPLIT",        (1, 1), (4, -1)),
         ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ("ROWBACKGROUNDS",(0, 1), (-1, -2), [colors.white, colors.HexColor("#F9F9F9")]),
         ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
@@ -1854,6 +2522,56 @@ def export_pdf(result, tour_date, driver_name):
     stops_table.setStyle(TableStyle(base_style + row_styles))
     story.append(stops_table)
     story.append(Spacer(1, 6*mm))
+
+    # ── Récapitulatif matériel (chargement / retour dépôt) ──
+    besoins_rec = result.get("besoins_records") or []
+    if besoins_rec:
+        story.append(HRFlowable(width="100%", thickness=1,
+                                 color=colors.HexColor("#1F4E79"),
+                                 spaceBefore=2, spaceAfter=6))
+        mat_title_style = ParagraphStyle("mat_title", parent=styles["Heading2"],
+                                          fontSize=12,
+                                          textColor=colors.HexColor("#1F4E79"),
+                                          spaceAfter=4)
+        story.append(Paragraph("Matériel à charger au départ du dépôt", mat_title_style))
+        mat_data = [[P(h, hdr_style) for h in
+                     ["Article", "Couleur", "À charger", "À rapporter",
+                      "Variation", "Stock avant tournée"]]]
+        mat_styles = []
+        for bi, b in enumerate(besoins_rec, 1):
+            mat_data.append([
+                P(b.get("Article", "")),
+                P(b.get("Couleur", "") or "Indifférente"),
+                P(str(b.get("Sorties", 0))),
+                P(str(b.get("Retours", 0))),
+                P(f"{b.get('Net', 0):+d}"),
+                P(str(b.get("StockAvant", ""))),
+            ])
+            if b.get("Manque", 0):
+                mat_styles.append(("BACKGROUND", (0, bi), (-1, bi),
+                                    colors.HexColor("#F8D7DA")))
+        mat_table = Table(mat_data,
+                          colWidths=[52*mm, 26*mm, 22*mm, 24*mm, 22*mm, 48*mm],
+                          repeatRows=1)
+        mat_table.setStyle(TableStyle([
+            ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+            ("ALIGN",          (0, 0), (-1, -1), "CENTER"),
+            ("ALIGN",          (0, 1), (1, -1), "LEFT"),
+            ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.white, colors.HexColor("#F9F9F9")]),
+            ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+            ("TOPPADDING",     (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 3),
+        ] + mat_styles))
+        story.append(mat_table)
+        story.append(Spacer(1, 3*mm))
+        story.append(Paragraph(
+            "Les lignes surlignées en rouge signalent un stock insuffisant au "
+            "moment de la préparation de la tournée.",
+            ParagraphStyle("mat_note", parent=styles["Normal"], fontSize=8,
+                            textColor=colors.HexColor("#666666"))))
+        story.append(Spacer(1, 4*mm))
 
     # ── Carte de la tournée ──
     story.append(Spacer(1, 6*mm))
@@ -2057,6 +2775,58 @@ with st.sidebar:
     st.caption("Assainissement · WC Chimiques")
     st.divider()
 
+    # ═════════════════════════════════════════════════════════════════════════
+    # IMPORT DU FICHIER DE STOCK (à faire à chaque ouverture de l'application)
+    # ═════════════════════════════════════════════════════════════════════════
+    st.subheader("📦 Stock du parc")
+
+    up_stock = st.file_uploader(
+        "Fichier Excel du stock",
+        type=["xlsx", "xlsm"],
+        key="uploader_stock",
+        help=(
+            "À importer **à chaque ouverture** de l'application : Streamlit ne "
+            "conserve aucune donnée entre deux sessions.\n\n"
+            "Le fichier doit contenir un onglet **Stock** avec les colonnes "
+            "**Article**, **Couleur**, **Installés**, **En stock**. "
+            "Le modèle téléchargeable depuis l'onglet *Stock & disponibilité* "
+            "est directement réimportable."
+        ),
+    )
+
+    if up_stock is not None:
+        file_id = f"{up_stock.name}-{up_stock.size}"
+        if st.session_state.stock_last_file_id != file_id:
+            df_imp, msg = parse_stock_excel(up_stock)
+            if df_imp is not None:
+                st.session_state.df_stock           = df_imp
+                st.session_state.stock_source       = f"Import : {up_stock.name}"
+                st.session_state.stock_import_ok    = True
+                st.session_state.stock_import_name  = up_stock.name
+                st.session_state.stock_last_file_id = file_id
+                st.success(f"✅ {msg}")
+                st.rerun()
+            else:
+                st.error(f"❌ {msg}")
+
+    _nb_ref  = len(st.session_state.df_stock)
+    _tot_stk = int(st.session_state.df_stock["En stock"].sum())
+    _tot_ins = int(st.session_state.df_stock["Installés"].sum())
+
+    if st.session_state.stock_import_ok:
+        st.success(
+            f"📥 **{st.session_state.stock_import_name}**  \n"
+            f"{_nb_ref} référence(s) · {_tot_stk} en stock · {_tot_ins} installé(s)"
+        )
+    else:
+        st.warning(
+            f"⚠️ **Aucun fichier importé.** Les valeurs de référence du relevé "
+            f"exploitation sont utilisées ({_tot_stk} en stock · {_tot_ins} installé(s)). "
+            f"Importez le fichier du jour pour travailler sur des données à jour."
+        )
+
+    st.divider()
+
     st.subheader("📅 Tournée")
     st.session_state.tour_date = st.date_input(
         "Date", value=st.session_state.tour_date, format="DD/MM/YYYY")
@@ -2234,9 +3004,10 @@ with st.sidebar:
 st.title("Optimisation Tournées WC chimiques - Deldossi Assainissement")
 st.caption(f"🏭 Départ : **{st.session_state.depot_depart_key}** · Retour : **{st.session_state.depot_retour_key}**")
 
-tab_saisie, tab_optim, tab_export = st.tabs([
+tab_saisie, tab_optim, tab_stock, tab_export = st.tabs([
     "📋  Saisie des arrêts",
     "🗺️  Tournée optimisée",
+    "📦  Stock & disponibilité",
     "📥  Export",
 ])
 
@@ -2313,12 +3084,18 @@ with tab_saisie:
         st.session_state.df_stops["Suppr"] = (
             st.session_state.df_stops["Suppr"].fillna(False).astype(bool))
 
+        # Migration : ajout de la colonne Couleur sur les sessions antérieures
+        if "Couleur" not in st.session_state.df_stops.columns:
+            st.session_state.df_stops["Couleur"] = ""
+        st.session_state.df_stops["Couleur"] = (
+            st.session_state.df_stops["Couleur"].fillna("").astype(str))
+
         st.data_editor(
             st.session_state.df_stops,
             use_container_width=True,
             num_rows="dynamic",
-            column_order=["Suppr", "Action", "Produit", "Option", "Quantité",
-                          "Nom du client", "Adresse", "Durée (min)",
+            column_order=["Suppr", "Action", "Produit", "Option", "Couleur",
+                          "Quantité", "Nom du client", "Adresse", "Durée (min)",
                           "Pas avant", "Pas après", "Observations"],
             column_config={
                 "Suppr": st.column_config.CheckboxColumn(
@@ -2330,12 +3107,18 @@ with tab_saisie:
                     options=["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]),
                 "Produit": st.column_config.SelectboxColumn(
                     "Produit", required=True, width="medium",
-                    options=["WC chimique", "Lave-main", "Urinoir", "WC handicapé", "WC client"]),
+                    options=PRODUITS_CATALOGUE),
                 "Option": st.column_config.SelectboxColumn(
                     "Option (WC chim. uniquement)", width="medium",
                     options=["", "Lave-main", "Urinoir"],
                     help="Réservée au WC chimique. Pour un Urinoir, un Lave-main ou "
                          "un WC handicapé, l'option est automatiquement vidée."),
+                "Couleur": st.column_config.SelectboxColumn(
+                    "🎨 Couleur", width="small",
+                    options=[""] + COULEURS_PRODUITS,
+                    help="Critère facultatif : à renseigner uniquement si le client "
+                         "exige une couleur précise. Laissée vide, la disponibilité "
+                         "est contrôlée toutes couleurs confondues."),
                 "Quantité": st.column_config.NumberColumn(
                     "Qté", required=True, width="small",
                     min_value=1, max_value=20, step=1, default=1,
@@ -2388,6 +3171,54 @@ with tab_saisie:
                 "l'option est automatiquement vidée."
             )
 
+        # ── Contrôle temps réel de la disponibilité en stock ──────────────────
+        _besoins_live = besoins_tournee(
+            live_df, inclure_manutentions=st.session_state.stock_manutentions)
+        _dispo_live = controle_disponibilite(st.session_state.df_stock, _besoins_live)
+
+        if len(_dispo_live) == 0:
+            _nb_retours = int(_besoins_live["Retours"].sum()) if len(_besoins_live) else 0
+            if _nb_retours > 0:
+                st.info(
+                    f"📥 Cette tournée génère uniquement des **retours au dépôt** "
+                    f"({_nb_retours} unité(s) réintégrée(s) en stock). "
+                    f"Aucun prélèvement de stock n'est nécessaire."
+                )
+            else:
+                st.caption(
+                    "📦 Aucun mouvement de matériel n'est généré par cette saisie "
+                    "(seules les actions *Déposer* et *Retirer* — et les manutentions "
+                    "si l'option est activée — affectent le parc)."
+                )
+        else:
+            _manquants = _dispo_live[_dispo_live["Manque"] > 0]
+            _justes    = _dispo_live[(_dispo_live["Manque"] == 0) &
+                                     (_dispo_live["Disponible"] == _dispo_live["Besoin"])]
+            if len(_manquants) > 0:
+                _lignes = "  \n".join(
+                    f"- **{r['Article']}** · {r['Couleur']} → besoin **{r['Besoin']}**, "
+                    f"disponible **{r['Disponible']}** → **{r['Manque']} manquant(s)**"
+                    for _, r in _manquants.iterrows()
+                )
+                st.error(
+                    "🔴 **Stock insuffisant pour cette tournée**  \n" + _lignes +
+                    "  \n\n➡️ Ajustez les quantités, les couleurs, ou consultez "
+                    "l'onglet **📦 Stock & disponibilité** pour arbitrer."
+                )
+            elif len(_justes) > 0:
+                st.warning(
+                    f"🟠 **Stock juste suffisant** sur {len(_justes)} référence(s) : "
+                    "la tournée videra complètement ces lignes de stock. "
+                    "Aucune marge en cas d'aléa terrain."
+                )
+            else:
+                _tot_sorties = int(_dispo_live["Besoin"].sum())
+                st.success(
+                    f"🟢 **Stock suffisant** — {_tot_sorties} unité(s) à sortir du dépôt, "
+                    f"toutes disponibles. Détail dans l'onglet "
+                    f"**📦 Stock & disponibilité**."
+                )
+
     with col_side:
         st.markdown("**Actions**")
         if st.button("➕ Ajouter un arrêt", use_container_width=True):
@@ -2395,7 +3226,7 @@ with tab_saisie:
             new_row = pd.DataFrame({
                 "Suppr": [False],
                 "Action": ["Nettoyer"], "Produit": ["WC chimique"],
-                "Option": ["Lave-main"], "Quantité": [1],
+                "Option": ["Lave-main"], "Couleur": [""], "Quantité": [1],
                 "Nom du client": [""], "Adresse": [""],
                 "Durée (min)": [30], "Pas avant": [""], "Pas après": [""],
                 "Observations": [""],
@@ -2705,6 +3536,8 @@ with tab_saisie:
                 "quantity":     _qty_label(row),
                 "produit":      row.get("Produit", ""),
                 "option":       row.get("Option",  ""),
+                "couleur":      normalize_couleur(row.get("Couleur", "")),
+                "article":      _article_key(row.get("Produit", ""), row.get("Option", "")),
                 "qty_num":      int(row.get("Quantité", 1) or 1),
                 "client":       row["Nom du client"],
                 "address":      row["Adresse"],
@@ -2802,6 +3635,10 @@ with tab_saisie:
             # Paramètres carburant (nécessaires pour recalcul manuel)
             "fuel_conso":         fuel_conso,
             "fuel_price":         fuel_price,
+            # Besoins matériel de la tournée (récap chargement + contrôle stock)
+            "besoins_records":    _besoins_records_pour_export(
+                valid_stops, st.session_state.df_stock,
+                st.session_state.stock_manutentions),
         }
         # Réinitialiser l'ordre manuel : une nouvelle optimisation annule
         # toute personnalisation précédente
@@ -3005,12 +3842,14 @@ with tab_optim:
                              f"{arr_icon} Arrivée estimée : {arr_str}</small>"
                              f"{wait_html}{dur_html}"
                              if arr_str else "")
+                coul_stop = stop.get("couleur", "") or ""
+                coul_html = (" " + _pastille_couleur(coul_stop)) if coul_stop else ""
                 st.markdown(
                     f'<div class="stop-card" style="background:{bg};'
                     f'border-left:4px solid {brd};">'
                     f'<b>#{stop["order_num"]} {stop["action"]}</b>{cli}<br>'
                     f'<small>📍 {stop["address"]}</small><br>'
-                    f'<small>📦 {stop["quantity"]}</small>'
+                    f'<small>📦 {stop["quantity"]}</small>{coul_html}'
                     f'{tw_html}{arr_html}</div>',
                     unsafe_allow_html=True,
                 )
@@ -3039,7 +3878,376 @@ with tab_optim:
             )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 3 — EXPORT
+# ONGLET 3 — STOCK & DISPONIBILITÉ
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_stock:
+
+    def _matrice_html(df, articles, couleurs, metrique, seuil):
+        """Construit la matrice HTML Article × Couleur.
+
+        metrique : 'En stock' | 'Installés' | 'Parc total'
+        Code couleur appliqué uniquement sur la métrique 'En stock' :
+            0 → rupture (rouge) · ≤ seuil → tension (orange) · sinon → OK (vert)
+        """
+        th = ('padding:8px 10px;text-align:center;font-size:0.82em;'
+              'border-bottom:2px solid #1F4E79;white-space:nowrap')
+        td = ('padding:7px 10px;text-align:center;font-size:0.95em;'
+              'border-bottom:1px solid #ECECEC')
+        html = ['<div style="overflow-x:auto"><table style="width:100%;'
+                'border-collapse:collapse;background:#fff;border-radius:8px">']
+        html.append('<thead><tr>')
+        html.append(f'<th style="{th};text-align:left;color:#1F4E79">Article</th>')
+        for c in couleurs:
+            html.append(f'<th style="{th}">{_pastille_couleur(c)}</th>')
+        html.append(f'<th style="{th};color:#1F4E79">Total</th></tr></thead><tbody>')
+
+        totaux_col = {c: 0 for c in couleurs}
+        total_gen  = 0
+        for a in articles:
+            sub = df[df["Article"] == a]
+            html.append('<tr>')
+            html.append(f'<td style="{td};text-align:left;font-weight:600;'
+                        f'color:#263238">{a}</td>')
+            ligne_total = 0
+            for c in couleurs:
+                s = sub[sub["Couleur"] == c]
+                if metrique == "Parc total":
+                    v = int(s["Installés"].sum() + s["En stock"].sum())
+                else:
+                    v = int(s[metrique].sum())
+                ligne_total += v
+                totaux_col[c] += v
+                if metrique == "En stock" and len(s) > 0:
+                    if v == 0:
+                        style = "background:#FDECEA;color:#B00020;font-weight:700"
+                    elif v <= seuil:
+                        style = "background:#FFF6E5;color:#B26A00;font-weight:700"
+                    else:
+                        style = "background:#EDF7ED;color:#1B5E20;font-weight:700"
+                elif v == 0:
+                    style = "color:#C7C7C7"
+                else:
+                    style = "color:#263238;font-weight:600"
+                aff = v if (v != 0 or len(s) > 0) else "·"
+                html.append(f'<td style="{td};{style}">{aff}</td>')
+            total_gen += ligne_total
+            html.append(f'<td style="{td};font-weight:700;color:#1F4E79;'
+                        f'background:#F4F7FB">{ligne_total}</td></tr>')
+
+        html.append(f'<tr><td style="{td};text-align:left;font-weight:700;'
+                    f'color:#1F4E79;background:#F4F7FB">TOTAL</td>')
+        for c in couleurs:
+            html.append(f'<td style="{td};font-weight:700;color:#1F4E79;'
+                        f'background:#F4F7FB">{totaux_col[c]}</td>')
+        html.append(f'<td style="{td};font-weight:800;color:#fff;'
+                    f'background:#1F4E79">{total_gen}</td></tr>')
+        html.append('</tbody></table></div>')
+        return "".join(html)
+
+    df_stock = _clean_stock_df(st.session_state.df_stock)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 1 — SOURCE DES DONNÉES ET FICHIERS
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 1\ufe0f\u20e3  Source des données")
+
+    if st.session_state.stock_import_ok:
+        st.success(
+            f"📥 Données issues du fichier **{st.session_state.stock_import_name}**, "
+            f"importé dans cette session."
+        )
+    else:
+        st.warning(
+            "⚠️ **Aucun fichier importé dans cette session.** Les valeurs affichées "
+            "proviennent du relevé de référence de l'exploitation. "
+            "L'application ne conserve rien entre deux sessions : importez le fichier "
+            "du jour depuis la barre latérale (**📦 Stock du parc**) pour travailler "
+            "sur des données à jour."
+        )
+
+    col_dl1, col_dl2, col_dl3 = st.columns(3)
+    _today_str = datetime.date.today().strftime("%d/%m/%Y")
+    _file_str  = datetime.date.today().strftime("%d-%m-%Y")
+
+    with col_dl1:
+        st.download_button(
+            "⬇️ Exporter le stock actuel",
+            data=export_stock_excel(df_stock, maj_date=_today_str),
+            file_name=f"Stock_parc_{_file_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, type="primary",
+            help="Classeur directement réimportable au prochain démarrage "
+                 "(onglets Stock + Synthèse).")
+    with col_dl2:
+        _modele = _stock_default_df().copy()
+        _modele[["Installés", "En stock"]] = 0
+        st.download_button(
+            "📄 Télécharger un modèle vierge",
+            data=export_stock_excel(_modele, maj_date=_today_str),
+            file_name="Modele_stock_parc.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Structure attendue à l'import : Article · Couleur · Installés · En stock.")
+    with col_dl3:
+        if st.button("♻️ Restaurer le relevé de référence",
+                     use_container_width=True,
+                     help="Revient aux valeurs du relevé transmis par l'exploitation."):
+            st.session_state.df_stock          = _stock_default_df()
+            st.session_state.stock_import_ok   = False
+            st.session_state.stock_import_name = None
+            st.session_state.stock_source      = "Valeurs de référence (relevé exploitation)"
+            if "editor_stock" in st.session_state:
+                del st.session_state["editor_stock"]
+            st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 2 — INDICATEURS DE PARC
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 2\ufe0f\u20e3  Vue d'ensemble du parc")
+
+    _tot_ins   = int(df_stock["Installés"].sum())
+    _tot_stk   = int(df_stock["En stock"].sum())
+    _tot_parc  = _tot_ins + _tot_stk
+    _nb_ref    = len(df_stock)
+    _nb_rup    = int((df_stock["En stock"] == 0).sum())
+    _taux      = (_tot_ins / _tot_parc * 100) if _tot_parc else 0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("🏗️ Parc total",      _tot_parc)
+    k2.metric("📦 En stock",        _tot_stk)
+    k3.metric("🏠 Installés",       _tot_ins)
+    k4.metric("📈 Taux d'usage",    f"{_taux:.0f} %",
+              help="Part du parc actuellement installée chez les clients.")
+    k5.metric("🔴 Réf. en rupture", _nb_rup,
+              delta=f"sur {_nb_ref} réf.", delta_color="off")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 3 — MATRICE ARTICLE × COULEUR
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 3\ufe0f\u20e3  Tableau du parc par produit et couleur")
+
+    f1, f2, f3 = st.columns([2, 2, 2])
+    with f1:
+        _metrique = st.radio(
+            "Donnée affichée",
+            ["En stock", "Installés", "Parc total"],
+            horizontal=True,
+            help="« En stock » = disponible au dépôt · « Installés » = chez les clients.")
+    with f2:
+        _couleurs_dispo = [c for c in COULEURS_PRODUITS
+                           if c in set(df_stock["Couleur"].astype(str))]
+        _couleurs_autres = sorted(set(df_stock["Couleur"].astype(str))
+                                  - set(COULEURS_PRODUITS) - {""})
+        _couleurs_dispo += list(_couleurs_autres)
+        _filtre_couleurs = st.multiselect(
+            "🎨 Filtrer par couleur", options=_couleurs_dispo,
+            default=_couleurs_dispo,
+            help="Décochez une couleur pour la masquer du tableau et des totaux.")
+    with f3:
+        _articles_dispo = ([a for a in ARTICLES_STOCK if a in set(df_stock["Article"])]
+                           + sorted(set(df_stock["Article"]) - set(ARTICLES_STOCK)))
+        _filtre_articles = st.multiselect(
+            "🧱 Filtrer par article", options=_articles_dispo,
+            default=_articles_dispo)
+
+    st.slider(
+        "Seuil d'alerte (tension de stock)", min_value=0, max_value=5,
+        key="stock_seuil_alerte",
+        help="Une quantité inférieure ou égale à ce seuil est signalée en orange "
+             "dans le tableau. Zéro reste toujours signalé en rouge.")
+
+    _df_f = df_stock[df_stock["Couleur"].isin(_filtre_couleurs) &
+                     df_stock["Article"].isin(_filtre_articles)]
+
+    if len(_df_f) == 0:
+        st.info("Aucune référence ne correspond aux filtres sélectionnés.")
+    else:
+        st.markdown(
+            _matrice_html(_df_f, _filtre_articles, _filtre_couleurs,
+                          _metrique, int(st.session_state.stock_seuil_alerte)),
+            unsafe_allow_html=True)
+        if _metrique == "En stock":
+            st.caption(
+                "🟢 disponible · 🟠 tension (≤ seuil d'alerte) · 🔴 rupture · "
+                "« · » : couleur non référencée pour cet article.")
+        else:
+            st.caption("« · » : couleur non référencée pour cet article.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 4 — TABLEAU DÉTAILLÉ MODIFIABLE
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 4\ufe0f\u20e3  Détail modifiable")
+    st.caption(
+        "Ajustez directement les quantités si le relevé a évolué depuis l'import. "
+        "Les modifications ne sont conservées que le temps de la session : "
+        "exportez le fichier après correction (bloc 1)."
+    )
+
+    _detail = df_stock.copy()
+    _detail["Parc total"] = _detail["Installés"] + _detail["En stock"]
+
+    _edit = st.data_editor(
+        _detail,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_order=STOCK_COLUMNS + ["Parc total"],
+        column_config={
+            "Article": st.column_config.SelectboxColumn(
+                "Article", required=True, width="large", options=ARTICLES_STOCK),
+            "Couleur": st.column_config.SelectboxColumn(
+                "🎨 Couleur", width="small", options=[""] + COULEURS_PRODUITS),
+            "Installés": st.column_config.NumberColumn(
+                "🏠 Installés", min_value=0, max_value=999, step=1, default=0,
+                width="small"),
+            "En stock": st.column_config.NumberColumn(
+                "📦 En stock", min_value=0, max_value=999, step=1, default=0,
+                width="small"),
+            "Parc total": st.column_config.NumberColumn(
+                "Σ Parc total", disabled=True, width="small",
+                help="Calculé : Installés + En stock. Recalculé après validation."),
+        },
+        hide_index=True,
+        key="editor_stock",
+    )
+
+    c_save, c_info = st.columns([1, 3])
+    with c_save:
+        if st.button("💾 Appliquer les modifications", use_container_width=True,
+                     type="primary"):
+            st.session_state.df_stock = _clean_stock_df(
+                _edit.drop(columns=[c for c in ("Parc total",) if c in _edit.columns]))
+            st.session_state.stock_source = "Saisie manuelle dans l'application"
+            del st.session_state["editor_stock"]
+            st.rerun()
+    with c_info:
+        st.caption(
+            "💡 Les doublons (même article, même couleur) sont automatiquement "
+            "fusionnés à la validation."
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 5 — CONFRONTATION AVEC LA TOURNÉE EN COURS
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 5\ufe0f\u20e3  Disponibilité pour la tournée en cours")
+
+    st.toggle(
+        "Comptabiliser les actions Chargement / Déchargement comme mouvements de stock",
+        key="stock_manutentions",
+        help=(
+            "**Désactivé (recommandé par défaut)** : seules les actions *Déposer* "
+            "(sortie de stock) et *Retirer* (retour en stock) génèrent un mouvement. "
+            "*Chargement* et *Déchargement* sont considérés comme des manutentions "
+            "internes sans impact sur le parc.\n\n"
+            "**Activé** : *Chargement* = retour au dépôt (+1 en stock), "
+            "*Déchargement* = dépose sur site (−1 en stock). "
+            "À activer uniquement si cette convention correspond à votre exploitation."
+        ),
+    )
+
+    _df_saisie = st.session_state.df_stops.copy()
+    _besoins   = besoins_tournee(
+        _df_saisie, inclure_manutentions=st.session_state.stock_manutentions)
+    _controle  = controle_disponibilite(df_stock, _besoins)
+
+    if len(_besoins) == 0:
+        st.info(
+            "ℹ️ Aucun mouvement de matériel n'est généré par la saisie actuelle. "
+            "Renseignez des arrêts avec une action *Déposer* ou *Retirer* et une "
+            "adresse pour obtenir le contrôle de disponibilité."
+        )
+    else:
+        _nb_manque = int((_controle["Manque"] > 0).sum()) if len(_controle) else 0
+        if _nb_manque > 0:
+            st.error(
+                f"🔴 **{_nb_manque} référence(s) en rupture** pour cette tournée. "
+                "Le détail ci-dessous indique la quantité manquante."
+            )
+        elif len(_controle) > 0:
+            st.success("🟢 **Toutes les sorties de matériel sont couvertes par le stock.**")
+
+        cbes, cctl = st.columns(2)
+        with cbes:
+            st.markdown("**📤 Mouvements générés par la tournée**")
+            _aff_bes = _besoins.copy()
+            _aff_bes["Couleur"] = _aff_bes["Couleur"].replace("", "Indifférente")
+            st.dataframe(
+                _aff_bes, use_container_width=True, hide_index=True,
+                column_config={
+                    "Sorties": st.column_config.NumberColumn("📤 À charger"),
+                    "Retours": st.column_config.NumberColumn("📥 À rapporter"),
+                    "Net":     st.column_config.NumberColumn(
+                        "Δ Stock", help="Variation prévisionnelle du stock au dépôt."),
+                })
+        with cctl:
+            st.markdown("**✅ Contrôle de disponibilité**")
+            if len(_controle) == 0:
+                st.caption("Aucune sortie de matériel à contrôler "
+                           "(la tournée ne génère que des retours).")
+            else:
+                st.dataframe(_controle, use_container_width=True, hide_index=True)
+
+        # ── Stock projeté après exécution de la tournée ──
+        st.markdown("**🔮 Parc projeté après exécution de la tournée**")
+        st.caption(
+            "Simulation appliquant les mouvements ci-dessus au parc actuel. "
+            "Les besoins sans couleur imposée sont imputés sur la couleur la mieux "
+            "dotée. Exportez ce fichier en fin de journée pour disposer d'un point "
+            "de départ à jour lors de la prochaine session."
+        )
+        _projete = projeter_stock(df_stock, _besoins)
+        _comp = _projete.merge(
+            df_stock, on=["Article", "Couleur"], how="left",
+            suffixes=("", "_avant")).fillna(0)
+        _comp["Δ Stock"] = (_comp["En stock"] - _comp["En stock_avant"]).astype(int)
+        _comp = _comp[_comp["Δ Stock"] != 0][
+            ["Article", "Couleur", "En stock_avant", "En stock", "Δ Stock"]]
+        _comp = _comp.rename(columns={"En stock_avant": "Avant", "En stock": "Après"})
+
+        if len(_comp) == 0:
+            st.caption("Aucune variation de stock à l'issue de cette tournée.")
+        else:
+            st.dataframe(_comp, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "⬇️ Exporter le parc projeté (fin de tournée)",
+            data=export_stock_excel(df_stock, df_projete=_projete, maj_date=_today_str),
+            file_name=f"Stock_parc_projete_{_file_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Contient l'état avant tournée (onglet Stock) et l'état projeté "
+                 "après tournée (onglet Stock projeté).")
+
+    with st.expander("📘 Règles de gestion appliquées"):
+        st.markdown(
+            "**Constitution des références**  \n"
+            "La référence article est déduite du couple *Produit* / *Option* saisi "
+            "dans le tableau des arrêts : un **WC chimique** avec l'option "
+            "*Lave-main* correspond à l'article **WC chimique + Lave-main**. "
+            "Le produit **WC client** appartient au client et n'est jamais décompté "
+            "du parc.\n\n"
+            "**Mouvements de stock**  \n"
+            "• *Déposer* : −1 en stock, +1 installé  \n"
+            "• *Retirer* : +1 en stock, −1 installé  \n"
+            "• *Nettoyer* : aucun mouvement (intervention sur place)  \n"
+            "• *Chargement* / *Déchargement* : neutres par défaut, configurables "
+            "via l'interrupteur ci-dessus\n\n"
+            "**Gestion de la couleur**  \n"
+            "La couleur est un critère facultatif. Renseignée, la disponibilité est "
+            "contrôlée sur cette couleur précise. Laissée vide, elle est contrôlée "
+            "toutes couleurs confondues pour l'article concerné.\n\n"
+            "**Persistance**  \n"
+            "Streamlit ne conserve aucune donnée entre deux sessions. Le cycle de "
+            "travail est : *importer le fichier au démarrage → travailler → exporter "
+            "le fichier mis à jour en fin de journée*."
+        )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ONGLET 4 — EXPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_export:
