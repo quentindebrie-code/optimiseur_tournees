@@ -414,7 +414,10 @@ def parse_stock_excel(uploaded_file):
 
     def _role_colonne(valeur):
         """Identifie le rôle d'un libellé de colonne, ou None."""
-        n = _norm_txt(valeur)
+        brut = str(valeur if valeur is not None else "").strip()
+        if len(brut) > 40:      # une phrase n'est pas un libellé de colonne
+            return None
+        n = _norm_txt(brut)
         if not n:
             return None
         if "article" in n or "produit" in n or "reference" in n or "designation" in n:
@@ -766,6 +769,506 @@ def _pastille_couleur(couleur, texte=None, taille="0.78em") -> str:
             f'{lbl}</span>')
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# IMPORT / EXPORT DE LA TOURNÉE (saisie des arrêts)
+# ═════════════════════════════════════════════════════════════════════════════
+# Objectif : permettre à l'exploitation de préparer une tournée dans Excel puis
+# de l'injecter dans l'application en un clic, plutôt que de tout ressaisir.
+# Le classeur produit par export_stops_excel() est directement réimportable.
+# ═════════════════════════════════════════════════════════════════════════════
+
+ACTIONS_CATALOGUE = ["Nettoyer", "Déposer", "Retirer", "Chargement", "Déchargement"]
+OPTIONS_CATALOGUE = ["Lave-main", "Urinoir"]
+
+# Colonnes métier du tableau de saisie (hors colonne technique « Suppr »)
+STOPS_COLUMNS = ["Action", "Produit", "Option", "Couleur", "Quantité",
+                 "Nom du client", "Adresse", "Durée (min)",
+                 "Pas avant", "Pas après", "Observations"]
+
+
+def normalize_action(valeur) -> tuple[str, bool]:
+    """Reconnaît une action écrite librement. Retourne (action, reconnue)."""
+    n = _norm_txt(valeur)
+    if not n:
+        return "Nettoyer", False
+    exact = {_norm_txt(a): a for a in ACTIONS_CATALOGUE}
+    if n in exact:
+        return exact[n], True
+    # « dechargement » contient « chargement » : on teste le plus long d'abord
+    for a in sorted(ACTIONS_CATALOGUE, key=lambda x: -len(x)):
+        if _norm_txt(a) in n or n in _norm_txt(a):
+            return a, True
+    return "Nettoyer", False
+
+
+def normalize_produit(valeur) -> tuple[str, bool]:
+    """Reconnaît un produit écrit librement. Retourne (produit, reconnu)."""
+    n = _norm_txt(valeur)
+    if not n:
+        return "WC chimique", False
+    exact = {_norm_txt(p): p for p in PRODUITS_CATALOGUE}
+    if n in exact:
+        return exact[n], True
+    if "client" in n:
+        return "WC client", True
+    if "pmr" in n or "handicap" in n:
+        return "WC handicapé", True
+    if "luxe" in n:
+        return "WC Luxe", True
+    if "lave" in n and "main" in n and not _re_stock.search(r"\bw[cl]\b", n):
+        return "Lave-main", True
+    if "urinoir" in n and not _re_stock.search(r"\bw[cl]\b", n):
+        return "Urinoir", True
+    if _re_stock.search(r"\bw[cl]\b", n) or "chimique" in n:
+        return "WC chimique", True
+    return "WC chimique", False
+
+
+def normalize_option_produit(valeur) -> tuple[str, bool]:
+    """Reconnaît une option (Lave-main / Urinoir). Retourne (option, reconnue)."""
+    n = _norm_txt(valeur)
+    if not n or n in ("-", "—", "aucune", "aucun", "nan"):
+        return "", True
+    if "lave" in n:
+        return "Lave-main", True
+    if "urinoir" in n:
+        return "Urinoir", True
+    return "", False
+
+
+def _hhmm_from_cell(valeur) -> str:
+    """Convertit une cellule Excel en 'HH:MM', ou '' si vide/illisible.
+
+    Gère les objets time/datetime d'Excel, les fractions de journée (0,375 = 09:00)
+    et les saisies texte libres ('9h30', '9:30', '0930').
+    """
+    if valeur is None:
+        return ""
+    try:
+        if isinstance(valeur, float) and pd.isna(valeur):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(valeur, datetime.datetime):
+        return valeur.strftime("%H:%M")
+    if isinstance(valeur, datetime.time):
+        return valeur.strftime("%H:%M")
+    if isinstance(valeur, (int, float)) and not isinstance(valeur, bool):
+        v = float(valeur)
+        if 0 <= v < 1:                      # fraction de journée
+            total = int(round(v * 24 * 60))
+            return f"{total // 60:02d}:{total % 60:02d}"
+        if 0 <= v <= 24:                    # heure entière saisie en nombre
+            return f"{int(v):02d}:00"
+        return ""
+    s = str(valeur).strip()
+    if not s or _norm_txt(s) in ("nan", "-", "—"):
+        return ""
+    m = _re_stock.match(r"^(\d{1,2})\s*[:hH.]\s*(\d{0,2})$", s)
+    if m:
+        h = int(m.group(1)); mi = int(m.group(2) or 0)
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return f"{h:02d}:{mi:02d}"
+    m = _re_stock.match(r"^(\d{2})(\d{2})$", s)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return f"{h:02d}:{mi:02d}"
+    return ""
+
+
+def _stops_template_df() -> pd.DataFrame:
+    """Tableau vide au format attendu (utilisé pour le modèle vierge)."""
+    return pd.DataFrame({c: pd.Series(dtype="object") for c in STOPS_COLUMNS})
+
+
+def export_stops_excel(df_stops: pd.DataFrame | None = None,
+                       nb_lignes_vides: int = 40,
+                       tour_date=None, driver_name="") -> BytesIO:
+    """Génère le classeur de saisie de tournée.
+
+    - Onglet « Tournée » : le tableau de saisie, avec listes déroulantes
+      (Action, Produit, Option, Couleur) pour éviter les fautes de frappe.
+    - Onglet « Notice »  : mode d'emploi et exemple commenté.
+    - Onglet « Listes »  : valeurs autorisées (masqué), support des validations.
+
+    df_stops = None → modèle vierge ; sinon export de la saisie en cours.
+    """
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = openpyxl.Workbook()
+    hdr_fill = PatternFill("solid", fgColor="1F4E79")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    center   = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left     = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    thin     = Side(style="thin", color="CCCCCC")
+    brd      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    oblig    = PatternFill("solid", fgColor="FFF3CD")
+
+    # ── Onglet « Listes » (support des menus déroulants) ──
+    wl = wb.create_sheet("Listes")
+    listes = {
+        "A": ("Action",  ACTIONS_CATALOGUE),
+        "B": ("Produit", PRODUITS_CATALOGUE),
+        "C": ("Option",  OPTIONS_CATALOGUE),
+        "D": ("Couleur", COULEURS_PRODUITS),
+    }
+    for col, (titre, vals) in listes.items():
+        wl[f"{col}1"] = titre
+        wl[f"{col}1"].font = Font(bold=True)
+        for i, v in enumerate(vals, start=2):
+            wl[f"{col}{i}"] = v
+    wl.sheet_state = "hidden"
+
+    # ── Onglet « Tournée » ──
+    ws = wb.active
+    ws.title = "Tournée"
+
+    titre = "SAISIE DE TOURNÉE – DELDOSSI ASSAINISSEMENT"
+    ws.append([titre])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(STOPS_COLUMNS))
+    ws.cell(1, 1).font = Font(bold=True, size=15, color="1F4E79")
+    ws.cell(1, 1).alignment = center
+    ws.row_dimensions[1].height = 28
+
+    sous_titre = []
+    if tour_date is not None:
+        sous_titre.append(f"Date : {tour_date.strftime('%d/%m/%Y')}")
+    if driver_name:
+        sous_titre.append(f"Chauffeur : {driver_name}")
+    sous_titre.append("Seule la colonne « Adresse » est obligatoire.")
+    ws.append([" · ".join(sous_titre)])
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(STOPS_COLUMNS))
+    ws.cell(2, 1).font = Font(italic=True, size=9, color="666666")
+    ws.cell(2, 1).alignment = center
+    ws.append([])
+
+    ws.append(STOPS_COLUMNS)
+    hr = ws.max_row
+    for col, h in enumerate(STOPS_COLUMNS, 1):
+        c = ws.cell(hr, col)
+        c.fill = hdr_fill; c.font = hdr_font
+        c.alignment = center; c.border = brd
+    ws.row_dimensions[hr].height = 30
+
+    # ── Lignes de données ──
+    lignes_ecrites = 0
+    if df_stops is not None and len(df_stops) > 0:
+        src = df_stops.copy()
+        for c in STOPS_COLUMNS:
+            if c not in src.columns:
+                src[c] = "" if c not in ("Quantité", "Durée (min)") else (1 if c == "Quantité" else 30)
+        for _, row in src.iterrows():
+            ws.append([row.get(c, "") if not pd.isna(row.get(c, "")) else ""
+                       for c in STOPS_COLUMNS])
+            lignes_ecrites += 1
+
+    premiere_ligne = hr + 1
+    derniere_ligne = hr + max(lignes_ecrites + nb_lignes_vides, nb_lignes_vides)
+
+    for r in range(premiere_ligne, derniere_ligne + 1):
+        for col in range(1, len(STOPS_COLUMNS) + 1):
+            c = ws.cell(r, col)
+            c.border = brd
+            c.alignment = left if STOPS_COLUMNS[col - 1] in (
+                "Nom du client", "Adresse", "Observations") else center
+        ws.cell(r, STOPS_COLUMNS.index("Adresse") + 1).fill = oblig
+
+    # ── Menus déroulants ──
+    def _lettre(nom):
+        return openpyxl.utils.get_column_letter(STOPS_COLUMNS.index(nom) + 1)
+
+    validations = [
+        ("Action",  f"Listes!$A$2:$A${len(ACTIONS_CATALOGUE) + 1}"),
+        ("Produit", f"Listes!$B$2:$B${len(PRODUITS_CATALOGUE) + 1}"),
+        ("Option",  f"Listes!$C$2:$C${len(OPTIONS_CATALOGUE) + 1}"),
+        ("Couleur", f"Listes!$D$2:$D${len(COULEURS_PRODUITS) + 1}"),
+    ]
+    for nom, plage in validations:
+        dv = DataValidation(type="list", formula1=plage, allow_blank=True,
+                            showDropDown=False)
+        dv.error = ("Valeur non autorisée. Sélectionnez une entrée dans la liste "
+                    "déroulante.")
+        dv.errorTitle = "Saisie invalide"
+        ws.add_data_validation(dv)
+        L = _lettre(nom)
+        dv.add(f"{L}{premiere_ligne}:{L}{derniere_ligne}")
+
+    for nom, mini, maxi in (("Quantité", 1, 20), ("Durée (min)", 1, 480)):
+        dvn = DataValidation(type="whole", operator="between",
+                             formula1=str(mini), formula2=str(maxi),
+                             allow_blank=True)
+        dvn.errorTitle = "Valeur hors limites"
+        dvn.error = f"Saisissez un nombre entier entre {mini} et {maxi}."
+        ws.add_data_validation(dvn)
+        L = _lettre(nom)
+        dvn.add(f"{L}{premiere_ligne}:{L}{derniere_ligne}")
+
+    largeurs = {"Action": 15, "Produit": 16, "Option": 13, "Couleur": 11,
+                "Quantité": 9, "Nom du client": 24, "Adresse": 46,
+                "Durée (min)": 12, "Pas avant": 11, "Pas après": 11,
+                "Observations": 34}
+    for col, nom in enumerate(STOPS_COLUMNS, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = largeurs[nom]
+    ws.freeze_panes = ws.cell(premiere_ligne, 1)
+
+    # ── Onglet « Notice » ──
+    wn = wb.create_sheet("Notice")
+    wn.append(["NOTICE DE SAISIE – TOURNÉE"])
+    wn.merge_cells("A1:C1")
+    wn.cell(1, 1).font = Font(bold=True, size=14, color="1F4E79")
+    wn.append([])
+    notice = [
+        ("Adresse", "OBLIGATOIRE",
+         "Adresse complète avec code postal et ville. Ex : Place d'Hautpoul 81600 Gaillac. "
+         "Une ligne sans adresse est ignorée à l'import."),
+        ("Action", "Liste déroulante",
+         "Nettoyer · Déposer · Retirer · Chargement · Déchargement. Par défaut : Nettoyer."),
+        ("Produit", "Liste déroulante",
+         "WC chimique · WC handicapé · WC Luxe · Lave-main · Urinoir · WC client. "
+         "Par défaut : WC chimique."),
+        ("Option", "Liste déroulante",
+         "Lave-main ou Urinoir. Ne s'applique qu'au WC chimique : la valeur est "
+         "automatiquement vidée pour les autres produits."),
+        ("Couleur", "Facultatif",
+         "À renseigner uniquement si le client exige une couleur précise. "
+         "Laissée vide, la disponibilité est contrôlée toutes couleurs confondues."),
+        ("Quantité", "Entier 1 à 20", "Nombre d'unités concernées. Par défaut : 1."),
+        ("Nom du client", "Facultatif", "Nom du client ou du site d'intervention."),
+        ("Durée (min)", "Entier 1 à 480",
+         "Durée d'intervention sur place. Par défaut : 30. Le bouton « Précalculer "
+         "les durées » de l'application recalcule cette colonne au barème."),
+        ("Pas avant", "Format HH:MM",
+         "Heure d'arrivée au plus tôt. Ex : 09:00. Laisser vide si aucune contrainte."),
+        ("Pas après", "Format HH:MM",
+         "Heure d'arrivée au plus tard. Ex : 11:30. Laisser vide si aucune contrainte."),
+        ("Observations", "Facultatif",
+         "Code portail, contact sur place, consignes particulières…"),
+    ]
+    wn.append(["Colonne", "Statut", "Explication"])
+    for col in range(1, 4):
+        c = wn.cell(wn.max_row, col)
+        c.fill = hdr_fill; c.font = hdr_font; c.alignment = center; c.border = brd
+    for nom, statut, expl in notice:
+        wn.append([nom, statut, expl])
+        r = wn.max_row
+        for col in range(1, 4):
+            wn.cell(r, col).border = brd
+            wn.cell(r, col).alignment = left
+        wn.cell(r, 1).font = Font(bold=True)
+        if statut == "OBLIGATOIRE":
+            wn.cell(r, 2).fill = oblig
+            wn.cell(r, 2).font = Font(bold=True, color="B26A00")
+    wn.append([])
+    wn.append(["EXEMPLE"])
+    wn.cell(wn.max_row, 1).font = Font(bold=True, size=12, color="1F4E79")
+    wn.append(["Déposer | WC chimique | Lave-main | Vert | 2 | Mairie de Gaillac | "
+               "Place d'Hautpoul 81600 Gaillac | 40 | 09:00 | (vide) | Code portail 1234"])
+    wn.merge_cells(start_row=wn.max_row, start_column=1,
+                   end_row=wn.max_row, end_column=3)
+    wn.cell(wn.max_row, 1).alignment = left
+    wn.cell(wn.max_row, 1).font = Font(italic=True, size=9, color="555555")
+    wn.append([])
+    wn.append(["L'ordre des lignes n'a aucune importance : l'application recalcule "
+               "l'itinéraire optimal."])
+    wn.merge_cells(start_row=wn.max_row, start_column=1,
+                   end_row=wn.max_row, end_column=3)
+    wn.cell(wn.max_row, 1).font = Font(italic=True, size=9, color="555555")
+    for col, w in zip(range(1, 4), [20, 18, 88]):
+        wn.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def parse_stops_excel(uploaded_file):
+    """Lit un classeur de tournée et retourne (DataFrame | None, message, avertissements).
+
+    Détection tolérante de l'onglet, de la ligne d'en-tête et des colonnes.
+    Les valeurs non reconnues sont ramenées à une valeur par défaut valide et
+    signalées dans la liste d'avertissements plutôt que de bloquer l'import.
+    """
+    avertissements = []
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+    except Exception as e:
+        return None, f"Fichier illisible : {e}", avertissements
+
+    def _role(valeur):
+        # Un libellé de colonne est court. Ce garde-fou évite qu'une phrase
+        # d'introduction contenant un mot-clé soit prise pour un en-tête.
+        brut = str(valeur if valeur is not None else "").strip()
+        if len(brut) > 40:
+            return None
+        n = _norm_txt(brut)
+        if not n:
+            return None
+        if "adresse" in n or n in ("lieu", "site"):
+            return "Adresse"
+        if "action" in n or "prestation" in n or "intervention" in n:
+            return "Action"
+        if "option" in n:
+            return "Option"
+        if "couleur" in n or "coloris" in n:
+            return "Couleur"
+        if "produit" in n or "materiel" in n or "equipement" in n or "article" in n:
+            return "Produit"
+        if n.startswith("qte") or "quantite" in n or n == "nb" or "nombre" in n:
+            return "Quantité"
+        if "client" in n or "nom" in n or "societe" in n:
+            return "Nom du client"
+        if "duree" in n or "temps" in n:
+            return "Durée (min)"
+        if "avant" in n or "au plus tot" in n or "ouverture" in n:
+            return "Pas avant"
+        if "apres" in n or "au plus tard" in n or "fermeture" in n:
+            return "Pas après"
+        if "observation" in n or "remarque" in n or "commentaire" in n or "note" in n:
+            return "Observations"
+        return None
+
+    # Onglet prioritaire : celui dont le nom évoque une tournée
+    ordre_onglets = sorted(
+        xls.sheet_names,
+        key=lambda s: 0 if ("tourn" in _norm_txt(s) or "arret" in _norm_txt(s)
+                            or "saisie" in _norm_txt(s)) else 1)
+
+    trouve = None
+    for sheet in ordre_onglets:
+        if _norm_txt(sheet) in ("listes", "notice"):
+            continue
+        try:
+            brut = xls.parse(sheet, header=None)
+        except Exception:
+            continue
+        if brut is None or len(brut) == 0:
+            continue
+        # On retient la ligne qui identifie le plus de colonnes, et non la
+        # première correspondance : un titre ou une consigne peut contenir
+        # fortuitement un mot-clé.
+        meilleur = None
+        for i in range(min(15, len(brut))):
+            candidat = {}
+            for j, val in enumerate(brut.iloc[i]):
+                r = _role(val)
+                if r and r not in candidat:
+                    candidat[r] = j
+            if "Adresse" in candidat and (meilleur is None
+                                          or len(candidat) > len(meilleur[1])):
+                meilleur = (i, candidat)
+        if meilleur:
+            trouve = (sheet, brut, meilleur[0], meilleur[1])
+            break
+
+    if not trouve:
+        return None, (
+            "Colonne « Adresse » introuvable. Le classeur doit comporter une ligne "
+            "d'en-tête contenant au minimum une colonne « Adresse ». "
+            "Utilisez le modèle vierge téléchargeable pour garantir la compatibilité."
+        ), avertissements
+
+    sheet, brut, header_row, mapping = trouve
+    corps = brut.iloc[header_row + 1:]
+
+    def _cell(row, nom, defaut=""):
+        if nom not in mapping:
+            return defaut
+        v = row.iloc[mapping[nom]]
+        try:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return defaut
+        except (TypeError, ValueError):
+            pass
+        return v
+
+    def _entier(v, defaut, mini, maxi):
+        try:
+            n = int(round(float(str(v).replace(",", ".").strip())))
+        except (ValueError, TypeError):
+            return defaut
+        return max(mini, min(maxi, n))
+
+    lignes = []
+    act_inconnues, prod_inconnus, opt_inconnues, heures_ko = set(), set(), set(), set()
+
+    for _, row in corps.iterrows():
+        adresse = str(_cell(row, "Adresse", "")).strip()
+        if not adresse or _norm_txt(adresse) in ("nan", "total", "-", "—"):
+            continue
+
+        action_brut = _cell(row, "Action", "")
+        action, ok_a = normalize_action(action_brut)
+        if not ok_a and str(action_brut).strip():
+            act_inconnues.add(str(action_brut).strip())
+
+        produit_brut = _cell(row, "Produit", "")
+        produit, ok_p = normalize_produit(produit_brut)
+        if not ok_p and str(produit_brut).strip():
+            prod_inconnus.add(str(produit_brut).strip())
+
+        option_brut = _cell(row, "Option", "")
+        option, ok_o = normalize_option_produit(option_brut)
+        if not ok_o and str(option_brut).strip():
+            opt_inconnues.add(str(option_brut).strip())
+
+        couleur = normalize_couleur(_cell(row, "Couleur", ""))
+        if couleur and couleur not in COULEURS_PRODUITS:
+            couleur = ""
+
+        pav_brut, pap_brut = _cell(row, "Pas avant", ""), _cell(row, "Pas après", "")
+        pav, pap = _hhmm_from_cell(pav_brut), _hhmm_from_cell(pap_brut)
+        for brut_v, converti in ((pav_brut, pav), (pap_brut, pap)):
+            if str(brut_v).strip() and not converti and _norm_txt(brut_v) != "nan":
+                heures_ko.add(str(brut_v).strip())
+
+        lignes.append({
+            "Suppr":         False,
+            "Action":        action,
+            "Produit":       produit,
+            "Option":        option,
+            "Couleur":       couleur,
+            "Quantité":      _entier(_cell(row, "Quantité", 1), 1, 1, 20),
+            "Nom du client": str(_cell(row, "Nom du client", "")).strip(),
+            "Adresse":       adresse,
+            "Durée (min)":   _entier(_cell(row, "Durée (min)", 30), 30, 1, 480),
+            "Pas avant":     pav,
+            "Pas après":     pap,
+            "Observations":  str(_cell(row, "Observations", "")).strip(),
+        })
+
+    if not lignes:
+        return None, (f"Aucun arrêt exploitable dans l'onglet « {sheet} » : "
+                      f"toutes les lignes sont sans adresse."), avertissements
+
+    df = pd.DataFrame(lignes, columns=["Suppr"] + STOPS_COLUMNS)
+    df = _normalize_option(df)
+
+    manquantes = [c for c in STOPS_COLUMNS if c not in mapping]
+    if manquantes:
+        avertissements.append(
+            "Colonnes absentes du fichier, valeurs par défaut appliquées : "
+            + ", ".join(manquantes))
+    if act_inconnues:
+        avertissements.append(
+            "Action non reconnue (remplacée par « Nettoyer ») : "
+            + ", ".join(sorted(act_inconnues)))
+    if prod_inconnus:
+        avertissements.append(
+            "Produit non reconnu (remplacé par « WC chimique ») : "
+            + ", ".join(sorted(prod_inconnus)))
+    if opt_inconnues:
+        avertissements.append(
+            "Option non reconnue (vidée) : " + ", ".join(sorted(opt_inconnues)))
+    if heures_ko:
+        avertissements.append(
+            "Horaire illisible (ignoré, format attendu HH:MM) : "
+            + ", ".join(sorted(heures_ko)))
+
+    return df, f"{len(df)} arrêt(s) importé(s) depuis l'onglet « {sheet} ».", avertissements
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NOMENCLATURE DES PIÈCES À CONTRÔLER (état des lieux WC chimique)
 # Regroupées par zone d'inspection physique pour un contrôle méthodique.
@@ -955,6 +1458,12 @@ if "stock_import_name"  not in st.session_state: st.session_state.stock_import_n
 if "stock_manutentions" not in st.session_state: st.session_state.stock_manutentions = False
 if "stock_seuil_alerte" not in st.session_state: st.session_state.stock_seuil_alerte = 1
 if "stock_last_file_id" not in st.session_state: st.session_state.stock_last_file_id = None
+
+# ── Import de tournée ────────────────────────────────────────────────────────
+if "stops_last_file_id" not in st.session_state: st.session_state.stops_last_file_id = None
+if "stops_import_name"  not in st.session_state: st.session_state.stops_import_name  = None
+if "stops_import_msg"   not in st.session_state: st.session_state.stops_import_msg   = None
+if "stops_import_warn"  not in st.session_state: st.session_state.stops_import_warn  = []
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCODAGE – API Adresse gouv.fr + fallback Nominatim
@@ -3057,9 +3566,124 @@ with tab_saisie:
         return _normalize_option(df)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # BLOC 1 — TABLEAU DE SAISIE (+ actions sur le côté)
+    # BLOC 1 — IMPORT DE LA TOURNÉE DEPUIS EXCEL
     # ══════════════════════════════════════════════════════════════════════════
-    st.markdown("### 1\ufe0f\u20e3  Tableau de saisie des arrêts")
+    st.markdown("### 1\ufe0f\u20e3  Import de la tournée")
+    st.caption(
+        "Préparez la tournée dans Excel puis injectez-la ici, ou saisissez-la "
+        "directement dans le tableau ci-dessous. L'ordre des lignes n'a aucune "
+        "importance : l'itinéraire est recalculé."
+    )
+
+    col_up, col_mode = st.columns([3, 2], gap="medium")
+
+    with col_up:
+        up_stops = st.file_uploader(
+            "Fichier Excel de la tournée",
+            type=["xlsx", "xlsm"],
+            key="uploader_stops",
+            help=(
+                "Le classeur doit comporter une ligne d'en-tête avec au minimum une "
+                "colonne **Adresse**. Les autres colonnes (Action, Produit, Option, "
+                "Couleur, Quantité, Durée, Pas avant, Pas après, Observations) sont "
+                "facultatives et prennent une valeur par défaut si absentes.\n\n"
+                "Le **modèle vierge** ci-contre garantit la compatibilité et intègre "
+                "des listes déroulantes."
+            ),
+        )
+
+    with col_mode:
+        _mode_import = st.radio(
+            "Mode d'import",
+            ["Remplacer la saisie", "Ajouter aux arrêts existants"],
+            key="stops_import_mode",
+            help=(
+                "**Remplacer** : le tableau est réinitialisé avec le contenu du fichier.\n\n"
+                "**Ajouter** : les arrêts du fichier sont ajoutés à la suite de ceux "
+                "déjà saisis (utile pour fusionner plusieurs secteurs)."
+            ),
+        )
+
+    if up_stops is not None:
+        _file_id_stops = f"{up_stops.name}-{up_stops.size}-{_mode_import}"
+        if st.session_state.stops_last_file_id != _file_id_stops:
+            _df_imp, _msg_imp, _warn_imp = parse_stops_excel(up_stops)
+            if _df_imp is not None:
+                if _mode_import.startswith("Ajouter"):
+                    _base = st.session_state.df_stops.copy()
+                    # On écarte les lignes vides du tableau d'accueil
+                    _base = _base[_base["Adresse"].fillna("").astype(str).str.strip() != ""]
+                    _df_final = pd.concat([_base, _df_imp], ignore_index=True)
+                else:
+                    _df_final = _df_imp
+                if "Couleur" not in _df_final.columns:
+                    _df_final["Couleur"] = ""
+                st.session_state.df_stops           = _df_final.reset_index(drop=True)
+                st.session_state.stops_last_file_id = _file_id_stops
+                st.session_state.stops_import_name  = up_stops.name
+                st.session_state.stops_import_msg   = _msg_imp
+                st.session_state.stops_import_warn  = _warn_imp
+                st.session_state.result             = None
+                st.session_state.manual_order       = None
+                st.session_state.manual_result      = None
+                if "editor_stops" in st.session_state:
+                    del st.session_state["editor_stops"]
+                st.rerun()
+            else:
+                st.error(f"❌ {_msg_imp}")
+
+    if st.session_state.stops_import_msg:
+        st.success(
+            f"📥 **{st.session_state.stops_import_name}** — "
+            f"{st.session_state.stops_import_msg}"
+        )
+        if st.session_state.stops_import_warn:
+            with st.expander(
+                    f"⚠️ {len(st.session_state.stops_import_warn)} point(s) de "
+                    "vigilance sur l'import"):
+                for _w in st.session_state.stops_import_warn:
+                    st.markdown(f"- {_w}")
+                st.caption(
+                    "Ces corrections ont été appliquées automatiquement pour ne pas "
+                    "bloquer l'import. Vérifiez les lignes concernées dans le tableau "
+                    "ci-dessous."
+                )
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.download_button(
+            "📄 Télécharger le modèle vierge",
+            data=export_stops_excel(None, tour_date=st.session_state.tour_date,
+                                    driver_name=st.session_state.driver),
+            file_name="Modele_saisie_tournee.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Classeur prêt à remplir : listes déroulantes sur Action, Produit, "
+                 "Option et Couleur, contrôles de saisie sur Quantité et Durée, "
+                 "et onglet Notice.")
+    with col_m2:
+        _df_export_stops = _current_df() if "editor_stops" in st.session_state \
+            else st.session_state.df_stops
+        _df_export_stops = _df_export_stops[
+            _df_export_stops["Adresse"].fillna("").astype(str).str.strip() != ""]
+        st.download_button(
+            "⬇️ Exporter la saisie en cours",
+            data=export_stops_excel(_df_export_stops,
+                                    tour_date=st.session_state.tour_date,
+                                    driver_name=st.session_state.driver),
+            file_name=f"Tournee_saisie_{st.session_state.tour_date.strftime('%d-%m-%Y')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            disabled=(len(_df_export_stops) == 0),
+            help="Sauvegarde le tableau actuel dans un classeur réimportable. "
+                 "Indispensable pour retrouver la tournée lors d'une prochaine session.")
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOC 2 — TABLEAU DE SAISIE (+ actions sur le côté)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 2\ufe0f\u20e3  Tableau de saisie des arrêts")
     st.caption(
         f"Départ : **{st.session_state.depot_depart_key}** · "
         f"Retour : **{st.session_state.depot_retour_key}** · "
@@ -3286,10 +3910,10 @@ with tab_saisie:
                        "des lignes à supprimer.")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # BLOC 2 — PRÉCALCUL DES DURÉES
+    # BLOC 3 — PRÉCALCUL DES DURÉES
     # ══════════════════════════════════════════════════════════════════════════
     st.divider()
-    st.markdown("### 2\ufe0f\u20e3  Précalcul des durées")
+    st.markdown("### 3\ufe0f\u20e3  Précalcul des durées")
     col_auto, col_info = st.columns([2, 3])
     with col_auto:
         if st.button("⏱️ Précalculer les durées (tous produits au barème)",
@@ -3359,10 +3983,10 @@ with tab_saisie:
         )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # BLOC 3 — OPTIMISATION DE LA TOURNÉE
+    # BLOC 4 — OPTIMISATION DE LA TOURNÉE
     # ══════════════════════════════════════════════════════════════════════════
     st.divider()
-    st.markdown("### 3\ufe0f\u20e3  Optimisation de la tournée")
+    st.markdown("### 4\ufe0f\u20e3  Optimisation de la tournée")
 
     if st.button("🚀 Optimiser la tournée", type="primary",
                  use_container_width=True, disabled=(n_valid < 1)):
