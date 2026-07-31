@@ -79,34 +79,27 @@ ACTION_MAP_ICONS = {
 # Consignes par type d'action (affichées dans le PDF)
 ACTION_CONSIGNES = {
     "Nettoyer": (
-        "Vidanger complètement la cuve. Nettoyer l'intérieur avec les produits homologués. "
-        "Vérifier et réapprovisionner les consommables (papier, gel désinfectant, savon). "
-        "Inspecter l'état général (porte, serrure, sol). Signaler tout dysfonctionnement "
-        "ou dégradation sur la fiche de tournée."
+        "Vidanger intégralement la cuve des eaux usées."
+        "Remplir le réservoir de chasse avec de l'eau propre en ajoutant une dose de produit sanitaire bleu."
+        "Remplir le réservoir d'eau propre destiné exclusivement au lave-mains."
+        "Nettoyer et désinfecter l'ensemble des surfaces intérieures à l'aide d'un spray désinfectant, puis rincer à l'eau claire."
+        "Contrôler et réapprovisionner les consommables : papier hygiénique, gel désinfectant et savon."
+        "Vérifier le bon état général de l'équipement (porte, serrure, plancher, cuves et accessoires)."
+        "Signaler toute anomalie, dégradation ou dysfonctionnement constaté sur la fiche de tournée."
     ),
     "Déposer": (
-        "Positionner l'équipement sur la zone désignée par le client, hors obstacle et "
-        "zone de passage. Vérifier la stabilité et l'aplomb. Vérifier la propreté avant "
-        "remise au client. Informer le client de la mise en service et lui remettre les "
-        "consignes d'utilisation si première installation."
+        "Positionner le WC sur l'emplacement désigné par le client, en dehors des zones de passage et de tout obstacle, sur un sol stable et plan."
+        "Vérifier la stabilité et l'aplomb de l'équipement."
+        "Remplir le réservoir de chasse avec de l'eau propre en ajoutant une dose de produit sanitaire bleu."
+        "Remplir le réservoir d'eau propre destiné exclusivement au lave-mains."
+        "Nettoyer et désinfecter l'ensemble des surfaces intérieures à l'aide d'un spray désinfectant, puis rincer à l'eau claire si nécessaire."
+        "Réapprovisionner les consommables : papier hygiénique, gel désinfectant et savon."
+        "Informer le client de la mise en service de l'équipement et, en cas de première installation, lui remettre les consignes d'utilisation."
     ),
     "Retirer": (
-        "Vidanger la cuve avant enlèvement, même si partiellement remplie. "
-        "Vérifier que la zone est propre et sans trace après retrait. "
-        "Noter l'état de l'équipement au chargement (dégradation, pièce manquante). "
-        "Obtenir la signature du bon de retrait si présence du client."
-    ),
-    "Chargement": (
-        "Vérifier l'état de l'équipement avant chargement (noter les dommages existants). "
-        "Arrimer correctement le chargement selon le plan de chargement. "
-        "S'assurer que le poids total ne dépasse pas la charge utile du véhicule avec remorque. "
-        "Vérifier les feux de la remorque avant départ."
-    ),
-    "Déchargement": (
-        "Décharger avec précaution en utilisant les équipements de manutention adaptés. "
-        "Vérifier l'état de l'équipement après déchargement. "
-        "Positionner sur l'aire de stockage désignée. "
-        "Renseigner le bon de livraison et faire signer le destinataire."
+        "Vidanger intégralement toutes les cuves avant l'enlèvement, y compris lorsqu'elles sont seulement partiellement remplies."
+        "Vérifier la propreté de la zone d'intervention et s'assurer qu'aucune trace ou salissure ne subsiste après le retrait de l'équipement."
+        "Contrôler l'état général du WC au moment du chargement et consigner toute dégradation, anomalie ou pièce manquante sur la fiche de tournée."
     ),
 }
 
