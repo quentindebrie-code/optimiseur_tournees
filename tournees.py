@@ -95,6 +95,7 @@ ACTION_CONSIGNES = {
         "Nettoyer et désinfecter l'ensemble des surfaces intérieures à l'aide d'un spray désinfectant, puis rincer à l'eau claire si nécessaire."
         "Réapprovisionner les consommables : papier hygiénique, gel désinfectant et savon."
         "Informer le client de la mise en service de l'équipement et, en cas de première installation, lui remettre les consignes d'utilisation."
+        "Prendre une photo une fois installé."
     ),
     "Retirer": (
         "Vidanger intégralement toutes les cuves avant l'enlèvement, y compris lorsqu'elles sont seulement partiellement remplies."
